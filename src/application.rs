@@ -974,15 +974,58 @@ impl Application {
             }
         };
 
-        // Look up agent config
+        // Return cached agent if already connected.
+        if let Some(existing) = self.agents.get(&agent_name) {
+            let capabilities =
+                serde_json::to_value(existing.capabilities.clone()).unwrap_or_default();
+            let auth_methods = serde_json::to_value(&existing.auth_methods).unwrap_or_default();
+            return Response::new_ok(
+                id,
+                serde_json::json!({
+                    "capabilities": capabilities,
+                    "authMethods": auth_methods,
+                }),
+            );
+        }
+
+        // Look up agent config or build from request params.
         let agent_config = match self.config.agents.get(&agent_name) {
             Some(config) => config.clone(),
             None => {
-                return Response::new_err(
-                    id,
-                    INTERNAL_ERROR,
-                    format!("unknown agent: {}", agent_name),
-                );
+                let command = match params.get("command").and_then(|v| v.as_str()) {
+                    Some(cmd) => cmd.to_string(),
+                    None => {
+                        return Response::new_err(
+                            id,
+                            INVALID_PARAMS,
+                            format!("unknown agent: {} (missing command)", agent_name),
+                        );
+                    }
+                };
+                let args = params
+                    .get("args")
+                    .and_then(|v| v.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let env = params.get("env").and_then(|v| v.as_object()).map(|obj| {
+                    obj.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect::<std::collections::HashMap<String, String>>()
+                });
+                let config = crate::config::AgentConfig {
+                    command,
+                    args,
+                    env,
+                    default_mode: None,
+                    default_model: None,
+                };
+                self.config.agents.insert(agent_name.clone(), config.clone());
+                config
             }
         };
 

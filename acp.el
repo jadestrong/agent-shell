@@ -87,7 +87,7 @@
 (defcustom acp-proxy-config-file nil
   "Explicit config file path for the ACP proxy, or nil to use the default."
   :type '(choice (const :tag "Default config" nil)
-                 (file :tag "Config file path"))
+          (file :tag "Config file path"))
   :group 'acp)
 
 ;; Timeout for long-running prompt requests (nil disables).
@@ -176,14 +176,6 @@ Other arguments match acp.el semantics."
 ;; Startup / shutdown
 ;; ---------------------------------------------------------------------------
 
-(defun acp--agent-name (client)
-  "Return agent name for CLIENT, deriving if needed."
-  (or (map-elt client :agent-name)
-      (when-let ((cmd (map-elt client :command)))
-        (format "%s-%s"
-                (file-name-nondirectory cmd)
-                (map-elt client :instance-count)))))
-
 (defun acp--env-alist (env-list)
   "Convert ENV-LIST of \"VAR=VAL\" strings to an alist."
   (let (out)
@@ -220,14 +212,24 @@ Other arguments match acp.el semantics."
 
 (defun acp--connect-agent (client)
   "Connect the agent for CLIENT via the proxy."
-  (let* ((agent-name (acp--agent-name client))
+  (let* ((agent-name (or (map-elt client :agent-name)
+                         (error ":agent-name is required")))
+         (command (map-elt client :command))
+         (args (map-elt client :command-params))
+         (env (acp--env-alist (map-elt client :environment-variables)))
+         (params (append (list :agentName agent-name)
+                         (when command
+                           (append (list :command command
+                                         :args (if args (vconcat args) []))
+                                   (when (and env (not (null env)))
+                                     (list :env env))))))
          (result (acp--jsonrpc-request
                   client
                   "acp/connectAgent"
-                  (list :agentName agent-name))))
-    (map-put! client :proxy-connected t)
-    (map-put! client :connect-result result)
-    result))
+                  params)))
+  (map-put! client :proxy-connected t)
+  (map-put! client :connect-result result)
+  result))
 
 (defun acp--ensure-connected (client)
   "Ensure CLIENT is connected to its agent."
@@ -271,27 +273,27 @@ Other arguments match acp.el semantics."
                                        (funcall handler std-error)))))))
       (setq acp--log-file (concat acp-log-file-directory filename))
       (let* ((proxy-args (append (list "--stdio" "--log-level" acp-log-level)
-                                (when proxy-config
-                                  (list "--config" proxy-config))
-                                (list "--log-file" acp--log-file)))
-            (conn (jsonrpc-process-connection
-                   :name "acp-shared"
-                   :process
-                   (lambda (_connection)
-                     (make-process
-                      :name "acp-shared"
-                      :command (cons proxy-program proxy-args)
-                      :connection-type 'pipe
-                      :noquery t
-                      :stderr stderr-proc))
-                   :notification-dispatcher
-                   (lambda (_conn method params)
-                     (acp--jsonrpc-notification-dispatcher client method params))
-                   :request-dispatcher
-                   (lambda (_conn method params)
-                     (acp--jsonrpc-request-dispatcher client method params))
-                   :on-shutdown (lambda (connection)
-                                  (acp--process-sentinel client connection)))))
+                                 (when proxy-config
+                                   (list "--config" proxy-config))
+                                 (list "--log-file" acp--log-file)))
+             (conn (jsonrpc-process-connection
+                    :name "acp-shared"
+                    :process
+                    (lambda (_connection)
+                      (make-process
+                       :name "acp-shared"
+                       :command (cons proxy-program proxy-args)
+                       :connection-type 'pipe
+                       :noquery t
+                       :stderr stderr-proc))
+                    :notification-dispatcher
+                    (lambda (_conn method params)
+                      (acp--jsonrpc-notification-dispatcher client method params))
+                    :request-dispatcher
+                    (lambda (_conn method params)
+                      (acp--jsonrpc-request-dispatcher client method params))
+                    :on-shutdown (lambda (connection)
+                                   (acp--process-sentinel client connection)))))
         (setq acp--shared-connection conn)
         (setq acp--shared-process (jsonrpc--process conn))
         (setq acp--shared-clients 1)
@@ -431,19 +433,25 @@ and invoked with BUFFER as current."
          (params (map-elt request :params)))
     (pcase method
       ("initialize"
-       (list "acp/connectAgent"
-             (list :agentName (acp--agent-name client))
-             (lambda (result) result)))
+       (let ((agent-name (or (map-elt client :agent-name)
+                             (error ":agent-name is required"))))
+         (list "acp/connectAgent"
+               (list :agentName agent-name)
+               (lambda (result) result))))
       ("authenticate"
-       (let ((method-id (acp--get params 'methodId)))
+       (let ((agent-name (or (map-elt client :agent-name)
+                             (error ":agent-name is required")))
+             (method-id (acp--get params 'methodId)))
          (list "acp/authenticate"
-               (list :agentName (acp--agent-name client)
+               (list :agentName agent-name
                      :authMethodId method-id)
                (lambda (result) result))))
       ("session/new"
-       (let ((cwd (acp--get params 'cwd)))
+       (let ((agent-name (or (map-elt client :agent-name)
+                             (error ":agent-name is required")))
+             (cwd (acp--get params 'cwd)))
          (list "acp/newSession"
-               (list :agentName (acp--agent-name client)
+               (list :agentName agent-name
                      :cwd cwd
                      :mcpServers (or (acp--get params 'mcpServers) [])
                      :_meta (acp--get params '_meta))
