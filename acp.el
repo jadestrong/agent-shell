@@ -1,4 +1,4 @@
-;;; acp-proxy-core.el --- ACP-compatible core over ACP Proxy -*- lexical-binding: t; -*-
+;;; acp.el --- ACP-compatible core over ACP Proxy -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2025
 
@@ -10,13 +10,13 @@
 
 ;;; Commentary:
 ;;
-;; acp-proxy-core.el provides an ACP (Agent Client Protocol) compatible API
+;; acp.el provides an ACP (Agent Client Protocol) compatible API
 ;; matching acp.el, but routes all traffic through the Rust ACP proxy server.
 ;; This lets existing libraries that depend on acp.el keep working while using
 ;; the proxy for process management and streaming.
 ;;
 ;; Load this file before any library that does (require 'acp). It provides
-;; both 'acp and 'acp-proxy-core features.
+;; both 'acp and 'acp features.
 
 ;;; Code:
 
@@ -39,7 +39,7 @@
       (goto-char (point-max))
       (insert (format "%s %s %s\n" direction kind (map-elt message :json))))))
 
-(defconst acp-package-version "0.11.1-proxy-core")
+(defconst acp-package-version "0.11.1")
 (defconst acp--jsonrpc-version "2.0")
 
 (defvar acp-logging-enabled nil)
@@ -49,58 +49,70 @@
 ;; Global shared proxy state
 ;; ---------------------------------------------------------------------------
 
-(defvar acp-proxy-core--shared-connection nil
+(defvar acp--shared-connection nil
   "Shared jsonrpc connection to the proxy process.")
 
-(defvar acp-proxy-core--shared-process nil
+(defvar acp--shared-process nil
   "Shared proxy process.")
 
-(defvar acp-proxy-core--shared-config-file nil
+(defvar acp--shared-config-file nil
   "Path to the shared proxy config file.")
 
-(defvar acp-proxy-core--shared-clients 0
+(defvar acp--shared-clients 0
   "Number of live clients attached to the shared proxy.")
 
-(defvar acp-proxy-core--shared-agents (make-hash-table :test 'equal)
+(defvar acp--shared-agents (make-hash-table :test 'equal)
   "Hash table of agent specs keyed by agent name.")
 
-(defvar acp-proxy-core--shared-active-agents (make-hash-table :test 'equal)
+(defvar acp--shared-active-agents (make-hash-table :test 'equal)
   "Agent names loaded in the currently running shared proxy.")
 
 ;; ---------------------------------------------------------------------------
 ;; Customization
 ;; ---------------------------------------------------------------------------
 
-(defgroup acp-proxy-core nil
-  "ACP-compatible core over ACP Proxy."
-  :group 'tools
-  :prefix "acp-proxy-core-")
-
-(defcustom acp-proxy-core-proxy-program "emacs-acp-proxy"
+(defcustom acp-proxy-program "emacs-acp-proxy"
   "Path to the ACP Proxy server binary."
   :type 'string
-  :group 'acp-proxy-core)
+  :group 'acp)
 
-(defcustom acp-proxy-core-log-level "info"
+(defcustom acp-log-level "info"
   "Log level for the ACP Proxy server."
   :type '(choice (const "trace")
           (const "debug")
           (const "info")
           (const "warn")
           (const "error"))
-  :group 'acp-proxy-core)
+  :group 'acp)
 
-(defcustom acp-proxy-core-log-file nil
-  "Path to the ACP Proxy log file. When nil, log to stderr."
-  :type '(choice (const :tag "Stderr (default)" nil)
-          (file :tag "Log file path"))
-  :group 'acp-proxy-core)
+(defcustom acp-log-file-directory temporary-file-directory
+  "The directory for `lsp-proxy' server to generate log file."
+  :type 'string
+  :group 'acp)
 
-(defcustom acp-proxy-core-temp-dir
-  (expand-file-name "acp-proxy-core/" temporary-file-directory)
+;; (defcustom acp-log-file nil
+;;   "Path to the ACP Proxy log file. When nil, log to stderr."
+;;   :type '(choice (const :tag "Stderr (default)" nil)
+;;           (file :tag "Log file path"))
+;;   :group 'acp)
+
+(defcustom acp-temp-dir
+  (expand-file-name "acp/" temporary-file-directory)
   "Directory for generated proxy config files."
   :type 'directory
-  :group 'acp-proxy-core)
+  :group 'acp)
+
+(defvar acp--log-file nil
+  "Path to the current log file.")
+
+(defun acp-open-log-file ()
+  "Open the current ACP proxy log file."
+  (interactive)
+  (unless acp--log-file
+    (user-error "acp--log-file is nil; logs are sent to stderr"))
+  (unless (file-exists-p acp--log-file)
+    (user-error "Log file does not exist: %s" acp--log-file))
+  (find-file acp--log-file))
 
 ;; ---------------------------------------------------------------------------
 ;; Client construction
@@ -114,7 +126,7 @@
 
 COMMAND and COMMAND-PARAMS are the ACP agent process to run via the proxy.
 ENVIRONMENT-VARIABLES is a list of strings in the form \"VAR=foo\".
-PROXY-PROGRAM overrides `acp-proxy-core-proxy-program'.
+PROXY-PROGRAM overrides `acp-proxy-program'.
 PROXY-CONFIG-FILE uses an existing proxy config file.
 AGENT-NAME overrides the generated agent name.
 Other arguments match acp.el semantics."
@@ -128,6 +140,8 @@ Other arguments match acp.el semantics."
         (cons :command-params command-params)
         (cons :environment-variables environment-variables)
         (cons :pending-requests ())
+        (cons :pending-incoming-responses (make-hash-table :test 'equal))
+        (cons :incoming-request-id 0)
         (cons :request-id 0)
         (cons :notification-handlers ())
         (cons :request-handlers ())
@@ -137,7 +151,7 @@ Other arguments match acp.el semantics."
         (cons :request-resolver (or request-resolver #'acp--request-resolver))
         (cons :response-sender (or response-sender #'acp--response-sender))
         (cons :outgoing-request-decorator outgoing-request-decorator)
-        (cons :proxy-program (or proxy-program acp-proxy-core-proxy-program))
+        (cons :proxy-program (or proxy-program acp-proxy-program))
         (cons :proxy-config-file proxy-config-file)
         (cons :agent-name agent-name)
         (cons :proxy-connected nil)
@@ -155,7 +169,7 @@ Other arguments match acp.el semantics."
 ;; Startup / shutdown
 ;; ---------------------------------------------------------------------------
 
-(defun acp-proxy-core--agent-name (client)
+(defun acp--agent-name (client)
   "Return agent name for CLIENT, deriving if needed."
   (or (map-elt client :agent-name)
       (when-let ((cmd (map-elt client :command)))
@@ -163,82 +177,89 @@ Other arguments match acp.el semantics."
                 (file-name-nondirectory cmd)
                 (map-elt client :instance-count)))))
 
-(defun acp-proxy-core--env-alist (env-list)
+(defun acp--env-alist (env-list)
   "Convert ENV-LIST of \"VAR=VAL\" strings to an alist."
   (let (out)
     (dolist (entry env-list (nreverse out))
       (when (string-match "\\`\\([^=]+\\)=\\(.*\\)\\'" entry)
         (push (cons (match-string 1 entry) (match-string 2 entry)) out)))))
 
-(defun acp-proxy-core--agent-spec (client)
+(defun acp--agent-spec (client)
   "Return an agent spec plist for CLIENT."
   (list :command (map-elt client :command)
         :args (map-elt client :command-params)
-        :env (acp-proxy-core--env-alist (map-elt client :environment-variables))))
+        :env (acp--env-alist (map-elt client :environment-variables))))
 
-(defun acp-proxy-core--register-agent (client)
+(defun acp--register-agent (client)
   "Register CLIENT agent spec in the shared registry."
-  (let* ((agent-name (acp-proxy-core--agent-name client))
-         (spec (acp-proxy-core--agent-spec client))
-         (existing (gethash agent-name acp-proxy-core--shared-agents)))
+  (let* ((agent-name (acp--agent-name client))
+         (spec (acp--agent-spec client))
+         (existing (gethash agent-name acp--shared-agents)))
     (when (and existing (not (equal existing spec)))
       (error "Conflicting agent spec for %s in shared proxy" agent-name))
-    (puthash agent-name spec acp-proxy-core--shared-agents)
+    (puthash agent-name spec acp--shared-agents)
     agent-name))
 
-(defun acp-proxy-core--write-shared-config ()
+(defun acp--write-shared-config ()
   "Write shared proxy config for all registered agents."
-  (let* ((dir (file-name-as-directory (expand-file-name acp-proxy-core-temp-dir)))
-         (path (or acp-proxy-core--shared-config-file
-                   (make-temp-file (expand-file-name "agents-" dir) nil ".toml"))))
+  (let* ((dir (file-name-as-directory (expand-file-name acp-temp-dir))))
     (make-directory dir t)
-    (with-temp-buffer
-      (insert (format "log_level = \"%s\"\n\n" acp-proxy-core-log-level))
-      (maphash
-       (lambda (agent-name spec)
-         (let ((cmd (plist-get spec :command))
-               (args (plist-get spec :args))
-               (env (plist-get spec :env)))
-           (insert (format "[agents.%s]\n" agent-name))
-           (when cmd
-             (insert (format "command = \"%s\"\n"
-                             (replace-regexp-in-string "\\\"" "\\\\\"" cmd))))
-           (when args
-             (insert "args = [")
-             (insert (mapconcat (lambda (a)
-                                  (format "\"%s\"" (replace-regexp-in-string "\\\"" "\\\\\"" a)))
-                                args
-                                ", "))
-             (insert "]\n"))
-           (when env
-             (insert "env = { ")
-             (insert (mapconcat (lambda (pair)
-                                  (format "\"%s\" = \"%s\""
-                                          (car pair)
-                                          (replace-regexp-in-string "\\\"" "\\\\\"" (cdr pair))))
-                                env
-                                ", "))
-             (insert " }\n"))))
-       acp-proxy-core--shared-agents)
-      (write-region (point-min) (point-max) path nil 'quiet))
-    (setq acp-proxy-core--shared-config-file path)
-    path))
+    (let* ((path (or acp--shared-config-file
+                     (make-temp-file (expand-file-name "agents-" dir) nil ".toml"))))
+      (with-temp-buffer
+        (insert (format "log_level = \"%s\"\n\n" acp-log-level))
+        (maphash
+         (lambda (agent-name spec)
+           (let ((cmd (plist-get spec :command))
+                 (args (plist-get spec :args))
+                 (env (plist-get spec :env)))
+             (insert (format "[agents.%s]\n" agent-name))
+             (when cmd
+               (insert (format "command = \"%s\"\n"
+                               (replace-regexp-in-string "\\\"" "\\\\\"" cmd))))
+             (when args
+               (insert "args = [")
+               (insert (mapconcat (lambda (a)
+                                    (format "\"%s\"" (replace-regexp-in-string "\\\"" "\\\\\"" a)))
+                                  args
+                                  ", "))
+               (insert "]\n"))
+             (when env
+               (insert "env = { ")
+               (insert (mapconcat (lambda (pair)
+                                    (format "\"%s\" = \"%s\""
+                                            (car pair)
+                                            (replace-regexp-in-string "\\\"" "\\\\\"" (cdr pair))))
+                                  env
+                                  ", "))
+               (insert " }\n"))))
+         acp--shared-agents)
+        (write-region (point-min) (point-max) path nil 'quiet))
+      (setq acp--shared-config-file path)
+      path)))
 
-(defun acp-proxy-core--jsonrpc-request (client method params &optional callback error-callback)
+(defun acp--jsonrpc-request (client method params &optional callback error-callback)
   "Send JSON-RPC request to proxy for CLIENT." 
   (if (or callback error-callback)
       (jsonrpc-async-request
        (map-elt client :connection)
        (intern method)
        params
-       :success-fn (or callback #'ignore)
-       :error-fn (or error-callback #'ignore))
-    (jsonrpc-request (map-elt client :connection) (intern method) params)))
+       :success-fn (if callback
+                       (lambda (result)
+                         (funcall callback (acp--normalize-object result)))
+                     #'ignore)
+       :error-fn (if error-callback
+                     (lambda (err)
+                       (funcall error-callback (acp--normalize-object err)))
+                   #'ignore))
+    (acp--normalize-object
+     (jsonrpc-request (map-elt client :connection) (intern method) params))))
 
-(defun acp-proxy-core--connect-agent (client)
+(defun acp--connect-agent (client)
   "Connect the agent for CLIENT via the proxy."
-  (let* ((agent-name (acp-proxy-core--agent-name client))
-         (result (acp-proxy-core--jsonrpc-request
+  (let* ((agent-name (acp--agent-name client))
+         (result (acp--jsonrpc-request
                   client
                   "acp/connectAgent"
                   (list :agentName agent-name))))
@@ -246,13 +267,14 @@ Other arguments match acp.el semantics."
     (map-put! client :connect-result result)
     result))
 
-(defun acp-proxy-core--ensure-connected (client)
+(defun acp--ensure-connected (client)
   "Ensure CLIENT is connected to its agent."
   (unless (map-elt client :proxy-connected)
-    (acp-proxy-core--connect-agent client)))
+    (acp--connect-agent client)))
 
 (cl-defun acp--start-client (&key client)
   "Start CLIENT." 
+  (message "here?")
   (unless client
     (error ":client is required"))
   (unless (or (map-elt client :command) (map-elt client :agent-name))
@@ -262,27 +284,30 @@ Other arguments match acp.el semantics."
     (error ":proxy-config-file is required when :command is nil"))
   (when (acp--client-started-p client)
     (error "Client already started"))
-  (acp-proxy-core--register-agent client)
-  (if (and acp-proxy-core--shared-connection
-           acp-proxy-core--shared-process
-           (process-live-p acp-proxy-core--shared-process)
-           (jsonrpc-running-p acp-proxy-core--shared-connection))
+  (acp--register-agent client)
+  (if (and acp--shared-connection
+           acp--shared-process
+           (process-live-p acp--shared-process)
+           (jsonrpc-running-p acp--shared-connection))
       (progn
-        (let ((agent-name (acp-proxy-core--agent-name client)))
-          (unless (gethash agent-name acp-proxy-core--shared-active-agents)
+        (let ((agent-name (acp--agent-name client)))
+          (unless (gethash agent-name acp--shared-active-agents)
             (error "Agent %s not loaded in shared proxy; restart proxy to add it"
                    agent-name)))
-        (setq acp-proxy-core--shared-clients (1+ acp-proxy-core--shared-clients))
-        (map-put! client :connection acp-proxy-core--shared-connection)
-        (map-put! client :process acp-proxy-core--shared-process))
-    (let* ((proxy-program (map-elt client :proxy-program))
+        (setq acp--shared-clients (1+ acp--shared-clients))
+        (map-put! client :connection acp--shared-connection)
+        (map-put! client :process acp--shared-process))
+    (let* ((timestamp (format-time-string "%Y%m%d%H%M%S"))
+           (random-num (random 100000))
+           (filename (format "acp-%s-%05d.log" timestamp random-num))
+           (proxy-program (map-elt client :proxy-program))
            (proxy-config (or (map-elt client :proxy-config-file)
-                             (acp-proxy-core--write-shared-config)))
-           (_ (setq acp-proxy-core--shared-config-file proxy-config))
+                             (acp--write-shared-config)))
+           (_ (setq acp--shared-config-file proxy-config))
            (_ (map-put! client :proxy-config-file proxy-config))
-           (stderr-buffer (get-buffer-create "*acp-proxy-core-stderr(shared)*"))
+           (stderr-buffer (get-buffer-create "*acp-stderr(shared)*"))
            (stderr-proc (make-pipe-process
-                         :name "acp-proxy-core-stderr(shared)"
+                         :name "acp-stderr(shared)"
                          :buffer stderr-buffer
                          :filter (lambda (_process raw-output)
                                    (acp--log client "STDERR" "%s" (string-trim raw-output))
@@ -294,38 +319,37 @@ Other arguments match acp.el semantics."
                                                              (message . ,raw-output))))))
                                      (dolist (handler (map-elt client :error-handlers))
                                        (funcall handler std-error)))))))
-           (args (append (list "--stdio" "--log-level" acp-proxy-core-log-level
-                               "--config" proxy-config)
-                         (when acp-proxy-core-log-file
-                           (list "--log-file" acp-proxy-core-log-file))))
-           (conn (jsonrpc-process-connection
-                  :name "acp-proxy-core-shared"
-                  :process
-                  (lambda (_connection)
-                    (make-process
-                     :name "acp-proxy-core-shared"
-                     :command (cons proxy-program args)
-                     :connection-type 'pipe
-                     :noquery t
-                     :stderr stderr-proc))
-                  :notification-dispatcher
-                  (lambda (_conn method params)
-                    (acp-proxy-core--jsonrpc-notification-dispatcher client method params))
-                  :request-dispatcher
-                  (lambda (_conn method params)
-                    (acp-proxy-core--jsonrpc-request-dispatcher client method params))
-                  :on-shutdown (lambda (connection)
-                                 (acp-proxy-core--process-sentinel client connection)))))
-      (setq acp-proxy-core--shared-connection conn)
-      (setq acp-proxy-core--shared-process (jsonrpc--process conn))
-      (setq acp-proxy-core--shared-clients 1)
-      (clrhash acp-proxy-core--shared-active-agents)
-      (maphash (lambda (k _v) (puthash k t acp-proxy-core--shared-active-agents))
-               acp-proxy-core--shared-agents)
-      (map-put! client :connection acp-proxy-core--shared-connection)
-      (map-put! client :process acp-proxy-core--shared-process))))
+      (setq acp--log-file (concat acp-log-file-directory filename))
+      (let ((conn (jsonrpc-process-connection
+                   :name "acp-shared"
+                   :process
+                   (lambda (_connection)
+                     (make-process
+                      :name "acp-shared"
+                      :command (cons proxy-program (list "--stdio" "--log-level" acp-log-level
+                                                         "--config" proxy-config
+                                                         "--log-file" acp--log-file))
+                      :connection-type 'pipe
+                      :noquery t
+                      :stderr stderr-proc))
+                   :notification-dispatcher
+                   (lambda (_conn method params)
+                     (acp--jsonrpc-notification-dispatcher client method params))
+                   :request-dispatcher
+                   (lambda (_conn method params)
+                     (acp--jsonrpc-request-dispatcher client method params))
+                   :on-shutdown (lambda (connection)
+                                  (acp--process-sentinel client connection)))))
+        (setq acp--shared-connection conn)
+        (setq acp--shared-process (jsonrpc--process conn))
+        (setq acp--shared-clients 1)
+        (clrhash acp--shared-active-agents)
+        (maphash (lambda (k _v) (puthash k t acp--shared-active-agents))
+                 acp--shared-agents)
+        (map-put! client :connection acp--shared-connection)
+        (map-put! client :process acp--shared-process)))))
 
-(defun acp-proxy-core--process-sentinel (client connection)
+(defun acp--process-sentinel (client connection)
   "Handle proxy process shutdown for CONNECTION." 
   (let* ((proc (jsonrpc--process connection))
          (event (cond
@@ -333,10 +357,10 @@ Other arguments match acp.el semantics."
                   (format "exited (%s)" (process-status proc)))
                  (t "stopped"))))
     (acp--log client "PROCESS" "%s" event)
-    (setq acp-proxy-core--shared-connection nil)
-    (setq acp-proxy-core--shared-process nil)
-    (setq acp-proxy-core--shared-clients 0)
-    (clrhash acp-proxy-core--shared-active-agents)
+    (setq acp--shared-connection nil)
+    (setq acp--shared-process nil)
+    (setq acp--shared-clients 0)
+    (clrhash acp--shared-active-agents)
     (map-put! client :proxy-connected nil)
     (map-put! client :connection nil)
     (map-put! client :process nil)))
@@ -346,10 +370,10 @@ Other arguments match acp.el semantics."
   (unless client
     (error ":client is required"))
   (when (acp--client-started-p client)
-    (setq acp-proxy-core--shared-clients (max 0 (1- acp-proxy-core--shared-clients)))
-    (when (and (<= acp-proxy-core--shared-clients 0)
-               acp-proxy-core--shared-connection)
-      (jsonrpc-shutdown acp-proxy-core--shared-connection))
+    (setq acp--shared-clients (max 0 (1- acp--shared-clients)))
+    (when (and (<= acp--shared-clients 0)
+               acp--shared-connection)
+      (jsonrpc-shutdown acp--shared-connection))
     (map-put! client :proxy-connected nil)
     (map-put! client :connection nil)
     (map-put! client :process nil))
@@ -429,7 +453,7 @@ and invoked with BUFFER as current."
 ;; Outgoing requests/notifications (compatible with acp.el)
 ;; ---------------------------------------------------------------------------
 
-(defun acp-proxy-core--get (obj key)
+(defun acp--get (obj key)
   "Get KEY from OBJ supporting plist/alist/hash with keyword or symbol keys." 
   (let* ((k1 key)
          (k2 (if (keywordp key) (intern (substring (symbol-name key) 1)) (intern (format ":%s" key)))))
@@ -439,65 +463,65 @@ and invoked with BUFFER as current."
      ((listp obj) (or (cdr (assoc k1 obj)) (cdr (assoc k2 obj))))
      (t nil))))
 
-(defun acp-proxy-core--vector-of-chars-p (value)
+(defun acp--vector-of-chars-p (value)
   "Return non-nil if VALUE is a vector of character codes." 
   (and (vectorp value)
        (> (length value) 0)
        (seq-every-p #'integerp value)))
 
-(defun acp-proxy-core--normalize-prompt (prompt)
+(defun acp--normalize-prompt (prompt)
   "Normalize ACP prompt value to proxy-compatible message." 
   (cond
    ((stringp prompt) prompt)
-   ((acp-proxy-core--vector-of-chars-p prompt)
+   ((acp--vector-of-chars-p prompt)
     (apply #'string (append prompt nil)))
    (t prompt)))
 
-(defun acp-proxy-core--map-request (client request)
+(defun acp--map-request (client request)
   "Return (METHOD PARAMS RESULT-MAPPER) for proxy request." 
   (let* ((method (map-elt request :method))
          (params (map-elt request :params)))
     (pcase method
       ("initialize"
        (list "acp/connectAgent"
-             (list :agentName (acp-proxy-core--agent-name client))
+             (list :agentName (acp--agent-name client))
              (lambda (result) result)))
       ("authenticate"
-       (let ((method-id (acp-proxy-core--get params 'methodId)))
+       (let ((method-id (acp--get params 'methodId)))
          (list "acp/authenticate"
-               (list :agentName (acp-proxy-core--agent-name client)
+               (list :agentName (acp--agent-name client)
                      :authMethodId method-id)
                (lambda (result) result))))
       ("session/new"
-       (let ((cwd (acp-proxy-core--get params 'cwd)))
+       (let ((cwd (acp--get params 'cwd)))
          (list "acp/newSession"
-               (list :agentName (acp-proxy-core--agent-name client)
+               (list :agentName (acp--agent-name client)
                      :cwd cwd
-                     :mcpServers (or (acp-proxy-core--get params 'mcpServers) [])
-                     :_meta (acp-proxy-core--get params '_meta))
+                     :mcpServers (or (acp--get params 'mcpServers) [])
+                     :_meta (acp--get params '_meta))
                (lambda (result) result))))
       ("session/prompt"
-       (let ((session-id (acp-proxy-core--get params 'sessionId))
-             (prompt (or (acp-proxy-core--get params 'prompt)
-                         (acp-proxy-core--get params 'message))))
+       (let ((session-id (acp--get params 'sessionId))
+             (prompt (or (acp--get params 'prompt)
+                         (acp--get params 'message))))
          (list "acp/prompt"
                (list :sessionId session-id
-                     :message (acp-proxy-core--normalize-prompt prompt))
+                     :message (acp--normalize-prompt prompt))
                (lambda (result) result))))
       ("session/set_mode"
        (list "acp/setMode"
-             (list :sessionId (acp-proxy-core--get params 'sessionId)
-                   :modeId (acp-proxy-core--get params 'modeId))
+             (list :sessionId (acp--get params 'sessionId)
+                   :modeId (acp--get params 'modeId))
              (lambda (result) result)))
       ("session/set_model"
        (list "acp/setModel"
-             (list :sessionId (acp-proxy-core--get params 'sessionId)
-                   :modelId (acp-proxy-core--get params 'modelId))
+             (list :sessionId (acp--get params 'sessionId)
+                   :modelId (acp--get params 'modelId))
              (lambda (result) result)))
       ("session/cancel"
        (list "acp/cancel"
-             (list :sessionId (acp-proxy-core--get params 'sessionId)
-                   :reason (acp-proxy-core--get params 'reason))
+             (list :sessionId (acp--get params 'sessionId)
+                   :reason (acp--get params 'reason))
              (lambda (result) result)))
       ("session/list"
        (list "acp/listSessions" nil (lambda (result) result)))
@@ -554,7 +578,7 @@ When non-nil SYNC, send notification synchronously."
                 "Outgoing request decorator returned nil for \"%s\", sending original request"
                 (map-elt request :method))))
   (pcase-let ((`(,proxy-method ,proxy-params ,result-mapper)
-               (acp-proxy-core--map-request client request)))
+               (acp--map-request client request)))
     (unless proxy-method
       (let ((err (acp-make-error :code -32601 :message (format "Method not supported: %s" (map-elt request :method)))))
         (if on-failure
@@ -564,7 +588,7 @@ When non-nil SYNC, send notification synchronously."
           (error "ACP request failed: %s" err)))
       (cl-return-from acp--request-sender nil))
     (when (string= proxy-method "acp/connectAgent")
-      (acp-proxy-core--ensure-connected client)
+      (acp--ensure-connected client)
       (let ((result (map-elt client :connect-result)))
         (if sync
             (cl-return-from acp--request-sender (if result-mapper (funcall result-mapper result) result))
@@ -573,10 +597,10 @@ When non-nil SYNC, send notification synchronously."
               (with-current-buffer (or buffer (map-elt client :context-buffer) (current-buffer))
                 (funcall on-success (if result-mapper (funcall result-mapper result) result)))))
           (cl-return-from acp--request-sender nil))))
-    (acp-proxy-core--ensure-connected client)
+    (acp--ensure-connected client)
     (if sync
         (condition-case err
-            (let* ((result (acp-proxy-core--jsonrpc-request client proxy-method proxy-params))
+            (let* ((result (acp--jsonrpc-request client proxy-method proxy-params))
                    (mapped (if result-mapper (funcall result-mapper result) result)))
               mapped)
           (error
@@ -586,7 +610,7 @@ When non-nil SYNC, send notification synchronously."
                    (with-current-buffer (or buffer (map-elt client :context-buffer) (current-buffer))
                      (funcall on-failure err-obj)))
                (error "ACP request failed: %s" err-obj)))))
-      (acp-proxy-core--jsonrpc-request
+      (acp--jsonrpc-request
        client
        proxy-method
        proxy-params
@@ -601,147 +625,185 @@ When non-nil SYNC, send notification synchronously."
              (with-current-buffer (or buffer (map-elt client :context-buffer) (current-buffer))
                (funcall on-failure err))))))))
 
-(cl-defun acp--notification-sender (&key client notification sync)
-  "Send NOTIFICATION from CLIENT via proxy." 
-  (let* ((method (map-elt notification :method))
-         (params (map-elt notification :params)))
-    (pcase method
-      ("session/cancel"
-       (if sync
-           (acp-proxy-core--jsonrpc-request
+  (cl-defun acp--notification-sender (&key client notification sync)
+    "Send NOTIFICATION from CLIENT via proxy." 
+    (let* ((method (map-elt notification :method))
+           (params (map-elt notification :params)))
+      (pcase method
+        ("session/cancel"
+         (if sync
+             (acp--jsonrpc-request
+              client "acp/cancel"
+              (list :sessionId (acp--get params 'sessionId)
+                    :reason (acp--get params 'reason)))
+           (acp--jsonrpc-request
             client "acp/cancel"
-            (list :sessionId (acp-proxy-core--get params 'sessionId)
-                  :reason (acp-proxy-core--get params 'reason)))
-         (acp-proxy-core--jsonrpc-request
-          client "acp/cancel"
-          (list :sessionId (acp-proxy-core--get params 'sessionId)
-                :reason (acp-proxy-core--get params 'reason))
-          #'ignore #'ignore)))
+            (list :sessionId (acp--get params 'sessionId)
+                  :reason (acp--get params 'reason))
+            #'ignore #'ignore)))
+        (_
+         (acp--log client "NOTIFICATION" "Unsupported notification: %s" method)))))
+
+  (cl-defun acp-send-response (&key client response)
+    "Send a request RESPONSE from CLIENT." 
+    (unless client
+      (error ":client is required"))
+    (unless response
+      (error ":response is required"))
+    (let* ((request-id (map-elt response :request-id))
+           (pending (and request-id
+                         (gethash request-id (map-elt client :pending-incoming-responses)))))
+      (if pending
+          (progn
+            (setcar pending t)
+            (setcdr pending response))
+        (funcall (map-elt client :response-sender)
+                 :client client
+                 :response response))))
+
+  (defun acp--extract-permission-outcome (response)
+    "Extract (OUTCOME OPTION-ID) from RESPONSE." 
+    (let* ((result (map-elt response :result))
+           (outcome (or (acp--get result 'outcome) result))
+           (outcome-type (or (acp--get outcome 'outcome)
+                             (acp--get outcome 'status)))
+           (option-id (acp--get outcome 'optionId)))
+      (list outcome-type option-id)))
+
+  (defun acp--select-option-id (options)
+    "Pick a best-effort option id from OPTIONS list." 
+    (let ((opts (if (vectorp options) (append options nil) options))
+          (fallback nil))
+      (dolist (opt opts)
+        (let* ((opt-id (or (acp--get opt 'id)
+                           (acp--get opt 'optionId)))
+               (label (or (acp--get opt 'label)
+                          (acp--get opt 'title)
+                          "")))
+          (setq fallback (or fallback opt-id))
+          (when (and opt-id (string-match-p "\`\(reject\|deny\|cancel\)\'" (downcase opt-id)))
+            (cl-return-from acp--select-option-id opt-id))
+          (when (and opt-id (string-match-p "reject\|deny\|cancel" (downcase label)))
+            (cl-return-from acp--select-option-id opt-id))))
+      fallback))
+
+  (cl-defun acp--response-sender (&key client response)
+    "Send a request RESPONSE from CLIENT." 
+    (let* ((request-id (map-elt response :request-id))
+           (pending (and request-id
+                         (gethash request-id (map-elt client :pending-permission-requests)))))
+      (if (not pending)
+          (acp--log client "RESPONSE" "Unhandled response id: %s" request-id)
+        (let* ((outcome (acp--extract-permission-outcome response))
+               (outcome-type (car outcome))
+               (option-id (cadr outcome))
+               (options (plist-get pending :options))
+               (option-id (or option-id
+                              (when (and outcome-type (string= outcome-type "cancelled"))
+                                (acp--select-option-id options))
+                              (acp--select-option-id options))))
+          (remhash request-id (map-elt client :pending-permission-requests))
+          (acp--jsonrpc-request
+           client
+           "acp/respondPermission"
+           (list :requestId (plist-get pending :requestId)
+                 :sessionId (plist-get pending :sessionId)
+                 :optionId option-id)
+           #'ignore #'ignore)))))
+
+  (defun acp--next-incoming-request-id (client)
+    "Return a fresh ACP request id for incoming proxy requests." 
+    (let ((next (1+ (or (map-elt client :incoming-request-id) 0))))
+      (map-put! client :incoming-request-id next)
+      (format "req-%s" next)))
+
+  (defun acp--await-incoming-response (client request-id waiter)
+    "Wait for a RESPONSE to REQUEST-ID and return it." 
+    (while (and (not (car waiter))
+                (process-live-p (map-elt client :process)))
+      (accept-process-output nil 0.05))
+    (let ((response (cdr waiter)))
+      (remhash request-id (map-elt client :pending-incoming-responses))
+      response))
+
+  ;; ---------------------------------------------------------------------------
+  ;; Incoming proxy notifications -> ACP-compatible dispatch
+  ;; ---------------------------------------------------------------------------
+
+  (defun acp--dispatch-notification (client method params)
+    "Dispatch an ACP-compatible notification to CLIENT handlers." 
+    (let ((notification `((jsonrpc . ,acp--jsonrpc-version)
+                          (method . ,method)
+                          (params . ,params))))
+      (dolist (handler (map-elt client :notification-handlers))
+        (condition-case-unless-debug err
+            (funcall handler notification)
+          (error (acp--log client "NOTIFICATION HANDLER ERROR" "%S" err))))))
+
+  (defun acp--dispatch-request (client method params request-id)
+    "Dispatch an ACP-compatible request to CLIENT handlers." 
+    (let ((request `((jsonrpc . ,acp--jsonrpc-version)
+                     (method . ,method)
+                     (id . ,request-id)
+                     (params . ,params))))
+      (dolist (handler (map-elt client :request-handlers))
+        (condition-case-unless-debug err
+            (funcall handler request)
+          (error (acp--log client "REQUEST HANDLER ERROR" "%S" err))))))
+
+  (defun acp--jsonrpc-notification-dispatcher (client method params)
+    "Handle incoming JSON-RPC notification METHOD with PARAMS." 
+    (pcase (if (symbolp method) (symbol-name method) method)
+      ("acp/sessionUpdate"
+       (acp--dispatch-notification
+        client "session/update" (acp--normalize-object params)))
+      ("acp/permissionRequest"
+       (let* ((normalized (acp--normalize-object params))
+              (request-id (format "perm-%s" (map-elt client :request-id)))
+              (session-id (acp--get normalized 'sessionId))
+              (proxy-request-id (acp--get normalized 'requestId))
+              (options (acp--get normalized 'options)))
+         (map-put! client :request-id (1+ (map-elt client :request-id)))
+         (puthash request-id
+                  (list :requestId proxy-request-id
+                        :sessionId session-id
+                        :options options)
+                  (map-elt client :pending-permission-requests))
+         (acp--dispatch-request
+          client
+          "session/request_permission"
+          normalized
+          request-id)))
+      ("acp/authRequired"
+       (acp--dispatch-notification client "auth/required" (acp--normalize-object params)))
+      ("acp/agentDisconnected"
+       (acp--dispatch-notification client "agent/disconnected" (acp--normalize-object params)))
+      ("acp/fileChanged"
+       (acp--dispatch-notification client "fs/file_changed" (acp--normalize-object params)))
       (_
-       (acp--log client "NOTIFICATION" "Unsupported notification: %s" method)))))
+       (acp--dispatch-notification client
+                                   (acp--normalize-method method)
+                                   (acp--normalize-object params)))))
 
-(cl-defun acp-send-response (&key client response)
-  "Send a request RESPONSE from CLIENT." 
-  (unless client
-    (error ":client is required"))
-  (unless response
-    (error ":response is required"))
-  (funcall (map-elt client :response-sender)
-           :client client
-           :response response))
+  (defun acp--jsonrpc-request-dispatcher (client method params)
+    "Handle incoming JSON-RPC request METHOD with PARAMS." 
+    (let* ((method-name (acp--normalize-method method))
+           (normalized (acp--normalize-object params))
+           (request-id (acp--next-incoming-request-id client))
+           (waiter (cons nil nil)))
+      (puthash request-id waiter (map-elt client :pending-incoming-responses))
+      (acp--dispatch-request client method-name normalized request-id)
+      (let ((response (acp--await-incoming-response client request-id waiter)))
+        (unless response
+          (jsonrpc-error :code -32603
+                         :message (format "No response for %s" method-name)))
+        (if-let ((err (acp--get response 'error)))
+            (jsonrpc-error :code (or (acp--get err 'code) -32603)
+                           :message (or (acp--get err 'message) "Internal error")
+                           :data (acp--get err 'data))
+          (acp--get response 'result))))))
 
-(defun acp-proxy-core--extract-permission-outcome (response)
-  "Extract (OUTCOME OPTION-ID) from RESPONSE." 
-  (let* ((result (map-elt response :result))
-         (outcome (or (acp-proxy-core--get result 'outcome) result))
-         (outcome-type (or (acp-proxy-core--get outcome 'outcome)
-                           (acp-proxy-core--get outcome 'status)))
-         (option-id (acp-proxy-core--get outcome 'optionId)))
-    (list outcome-type option-id)))
-
-(defun acp-proxy-core--select-option-id (options)
-  "Pick a best-effort option id from OPTIONS list." 
-  (let ((opts (if (vectorp options) (append options nil) options))
-        (fallback nil))
-    (dolist (opt opts)
-      (let* ((opt-id (or (acp-proxy-core--get opt 'id)
-                         (acp-proxy-core--get opt 'optionId)))
-             (label (or (acp-proxy-core--get opt 'label)
-                        (acp-proxy-core--get opt 'title)
-                        "")))
-        (setq fallback (or fallback opt-id))
-        (when (and opt-id (string-match-p "\`\(reject\|deny\|cancel\)\'" (downcase opt-id)))
-          (cl-return-from acp-proxy-core--select-option-id opt-id))
-        (when (and opt-id (string-match-p "reject\|deny\|cancel" (downcase label)))
-          (cl-return-from acp-proxy-core--select-option-id opt-id))))
-    fallback))
-
-(cl-defun acp--response-sender (&key client response)
-  "Send a request RESPONSE from CLIENT." 
-  (let* ((request-id (map-elt response :request-id))
-         (pending (and request-id
-                       (gethash request-id (map-elt client :pending-permission-requests)))))
-    (if (not pending)
-        (acp--log client "RESPONSE" "Unhandled response id: %s" request-id)
-      (let* ((outcome (acp-proxy-core--extract-permission-outcome response))
-             (outcome-type (car outcome))
-             (option-id (cadr outcome))
-             (options (plist-get pending :options))
-             (option-id (or option-id
-                            (when (and outcome-type (string= outcome-type "cancelled"))
-                              (acp-proxy-core--select-option-id options))
-                            (acp-proxy-core--select-option-id options))))
-        (remhash request-id (map-elt client :pending-permission-requests))
-        (acp-proxy-core--jsonrpc-request
-         client
-         "acp/respondPermission"
-         (list :requestId (plist-get pending :requestId)
-               :sessionId (plist-get pending :sessionId)
-               :optionId option-id)
-         #'ignore #'ignore)))))
-
-;; ---------------------------------------------------------------------------
-;; Incoming proxy notifications -> ACP-compatible dispatch
-;; ---------------------------------------------------------------------------
-
-(defun acp-proxy-core--dispatch-notification (client method params)
-  "Dispatch an ACP-compatible notification to CLIENT handlers." 
-  (let ((notification `((jsonrpc . ,acp--jsonrpc-version)
-                        (method . ,method)
-                        (params . ,params))))
-    (dolist (handler (map-elt client :notification-handlers))
-      (condition-case-unless-debug err
-          (funcall handler notification)
-        (error (acp--log client "NOTIFICATION HANDLER ERROR" "%S" err))))))
-
-(defun acp-proxy-core--dispatch-request (client method params request-id)
-  "Dispatch an ACP-compatible request to CLIENT handlers." 
-  (let ((request `((jsonrpc . ,acp--jsonrpc-version)
-                   (method . ,method)
-                   (id . ,request-id)
-                   (params . ,params))))
-    (dolist (handler (map-elt client :request-handlers))
-      (condition-case-unless-debug err
-          (funcall handler request)
-        (error (acp--log client "REQUEST HANDLER ERROR" "%S" err))))))
-
-(defun acp-proxy-core--jsonrpc-notification-dispatcher (client method params)
-  "Handle incoming JSON-RPC notification METHOD with PARAMS." 
-  (pcase (if (symbolp method) (symbol-name method) method)
-    ("acp/sessionUpdate"
-     (acp-proxy-core--dispatch-notification
-      client "session/update" params))
-    ("acp/permissionRequest"
-     (let* ((request-id (format "perm-%s" (map-elt client :request-id)))
-            (session-id (acp-proxy-core--get params 'sessionId))
-            (proxy-request-id (acp-proxy-core--get params 'requestId))
-            (options (acp-proxy-core--get params 'options)))
-       (map-put! client :request-id (1+ (map-elt client :request-id)))
-       (puthash request-id
-                (list :requestId proxy-request-id
-                      :sessionId session-id
-                      :options options)
-                (map-elt client :pending-permission-requests))
-       (acp-proxy-core--dispatch-request
-        client
-        "session/request_permission"
-        params
-        request-id)))
-    ("acp/authRequired"
-     (acp-proxy-core--dispatch-notification client "auth/required" params))
-    ("acp/agentDisconnected"
-     (acp-proxy-core--dispatch-notification client "agent/disconnected" params))
-    ("acp/fileChanged"
-     (acp-proxy-core--dispatch-notification client "fs/file_changed" params))
-    (_
-     (acp-proxy-core--dispatch-notification client (acp-proxy-core--normalize-method method) params))))
-
-(defun acp-proxy-core--jsonrpc-request-dispatcher (_client method _params)
-  "Handle incoming JSON-RPC request METHOD from proxy.
-Proxy does not send requests; this is an error." 
-  (error "Unsupported request from proxy: %s" method))
-
-(defun acp-proxy-core--normalize-method (method)
+(defun acp--normalize-method (method)
   "Return METHOD as a string." 
   (cond
    ((symbolp method) (symbol-name method))
@@ -756,7 +818,7 @@ Proxy does not send requests; this is an error."
                                             client-info
                                             read-text-file-capability
                                             write-text-file-capability)
-  "Instantiate an "initialize" request." 
+  "Instantiate an \"initialize\" request." 
   (unless protocol-version
     (error ":protocol-version is required"))
   `((:method . "initialize")
@@ -767,7 +829,7 @@ Proxy does not send requests; this is an error."
                                               (writeTextFile . ,(if write-text-file-capability t :false))))))))))
 
 (cl-defun acp-make-authenticate-request (&key method-id method)
-  "Instantiate an "authenticate" request." 
+  "Instantiate an \"authenticate\" request." 
   (unless method-id
     (error ":method-id is required"))
   `((:method . "authenticate")
@@ -776,7 +838,7 @@ Proxy does not send requests; this is an error."
                           `((authMethod . ,method)))))))
 
 (cl-defun acp-make-session-new-request (&key cwd mcp-servers meta)
-  "Instantiate a "session/new" request." 
+  "Instantiate a \"session/new\" request." 
   (unless cwd
     (error ":cwd is required"))
   `((:method . "session/new")
@@ -785,7 +847,7 @@ Proxy does not send requests; this is an error."
                 ,@(when meta `((_meta . ,meta)))))))
 
 (cl-defun acp-make-session-prompt-request (&key session-id prompt)
-  "Instantiate a "session/prompt" request." 
+  "Instantiate a \"session/prompt\" request." 
   (unless session-id
     (error ":session-id is required"))
   (unless prompt
@@ -795,7 +857,7 @@ Proxy does not send requests; this is an error."
                 (prompt . ,(vconcat prompt))))))
 
 (cl-defun acp-make-session-set-mode-request (&key session-id mode-id)
-  "Instantiate a "session/set_mode" request." 
+  "Instantiate a \"session/set_mode\" request." 
   (unless session-id
     (error ":session-id is required"))
   (unless mode-id
@@ -805,7 +867,7 @@ Proxy does not send requests; this is an error."
                 (modeId . ,mode-id)))))
 
 (cl-defun acp-make-session-set-model-request (&key session-id model-id)
-  "Instantiate a "session/set_model" request." 
+  "Instantiate a \"session/set_model\" request." 
   (unless session-id
     (error ":session-id is required"))
   (unless model-id
@@ -815,7 +877,7 @@ Proxy does not send requests; this is an error."
                 (modelId . ,model-id)))))
 
 (cl-defun acp-make-session-resume-request (&key session-id cwd mcp-servers)
-  "Instantiate a "session/resume" request." 
+  "Instantiate a \"session/resume\" request." 
   (unless session-id
     (error ":session-id is required"))
   (unless cwd
@@ -826,14 +888,14 @@ Proxy does not send requests; this is an error."
                 (mcpServers . ,(or mcp-servers []))))))
 
 (cl-defun acp-make-session-list-request (&key cwd)
-  "Instantiate a "session/list" request." 
+  "Instantiate a \"session/list\" request." 
   (unless cwd
     (error ":cwd is required"))
   `((:method . "session/list")
     (:params . ((cwd . ,(directory-file-name (expand-file-name cwd)))))))
 
 (cl-defun acp-make-session-load-request (&key session-id cwd mcp-servers)
-  "Instantiate a "session/load" request." 
+  "Instantiate a \"session/load\" request." 
   (unless session-id
     (error ":session-id is required"))
   (unless cwd
@@ -844,14 +906,14 @@ Proxy does not send requests; this is an error."
                 (mcpServers . ,(or mcp-servers []))))))
 
 (cl-defun acp-make-session-delete-request (&key session-id)
-  "Instantiate a "session/delete" request." 
+  "Instantiate a \"session/delete\" request." 
   (unless session-id
     (error ":session-id is required"))
   `((:method . "session/delete")
     (:params . ((sessionId . ,session-id)))))
 
 (cl-defun acp-make-session-request-permission-response (&key request-id option-id cancelled)
-  "Instantiate a "session/request_permission" response." 
+  "Instantiate a \"session/request_permission\" response." 
   (unless request-id
     (error ":request-id is required"))
   (when (and option-id cancelled)
@@ -860,12 +922,12 @@ Proxy does not send requests; this is an error."
     (error "Must specify either :option-id or :cancelled"))
   `((:request-id . ,request-id)
     (:result . ((outcome . ,(if cancelled
-                                 '((outcome . "cancelled"))
-                               `((outcome . "selected")
-                                 (optionId . ,option-id))))))))
+                                '((outcome . "cancelled"))
+                              `((outcome . "selected")
+                                (optionId . ,option-id))))))))
 
 (cl-defun acp-make-fs-read-text-file-response (&key request-id content error)
-  "Instantiate a "fs/read_text_file" response." 
+  "Instantiate a \"fs/read_text_file\" response." 
   (unless request-id
     (error ":request-id is required"))
   (cond
@@ -881,7 +943,7 @@ Proxy does not send requests; this is an error."
     (error "Either :content or :error is required"))))
 
 (cl-defun acp-make-fs-write-text-file-response (&key request-id error)
-  "Instantiate a "fs/write_text_file" response." 
+  "Instantiate a \"fs/write_text_file\" response." 
   (unless request-id
     (error ":request-id is required"))
   (if error
@@ -903,7 +965,7 @@ Proxy does not send requests; this is an error."
     error))
 
 (cl-defun acp-make-session-cancel-notification (&key session-id reason)
-  "Instantiate a "session/cancel" request." 
+  "Instantiate a \"session/cancel\" request." 
   (unless session-id
     (error ":session-id is required"))
   `((:method . "session/cancel")
@@ -1054,6 +1116,47 @@ Returns non-nil if error was parseable."
   "Serialize OBJECT to JSON using a consistent configuration." 
   (concat (json-serialize object) "\n"))
 
+(defun acp--keyword-to-symbol (key)
+  "Convert KEY keyword to symbol without leading colon." 
+  (if (keywordp key)
+      (intern (substring (symbol-name key) 1))
+    key))
+
+(defun acp--normalize-object (obj)
+  "Normalize OBJ to use symbol keys in alists (not keywords).
+
+Converts plists and hash tables into alists with symbol keys,
+recursing into nested structures." 
+  (cond
+   ((hash-table-p obj)
+    (let (out)
+      (maphash (lambda (k v)
+                 (push (cons (acp--keyword-to-symbol k)
+                             (acp--normalize-object v))
+                       out))
+               obj)
+      (nreverse out)))
+   ((and (listp obj) (keywordp (car obj)))
+    (let (out)
+      (while obj
+        (let ((k (car obj))
+              (v (cadr obj)))
+          (push (cons (acp--keyword-to-symbol k)
+                      (acp--normalize-object v))
+                out))
+        (setq obj (cddr obj)))
+      (nreverse out)))
+   ((listp obj)
+    (mapcar (lambda (el)
+              (if (consp el)
+                  (cons (acp--keyword-to-symbol (car el))
+                        (acp--normalize-object (cdr el)))
+                (acp--normalize-object el)))
+            obj))
+   ((vectorp obj)
+    (apply #'vector (mapcar #'acp--normalize-object obj)))
+   (t obj)))
+
 (provide 'acp)
 
-;;; acp-proxy-core.el ends here
+;;; acp.el ends here
