@@ -132,8 +132,18 @@ enum BackupWriterEvent {
 }
 
 #[derive(Debug, Default, Clone)]
-struct SessionBackupRenderState {
-    last_message_id: Option<String>,
+struct ToolCallSnapshot {
+    title: Option<String>,
+    kind: Option<String>,
+    description: Option<String>,
+    command: Option<String>,
+    raw_input: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct SessionTranscriptState {
+    last_entry_type: Option<String>,
+    tool_calls: HashMap<String, ToolCallSnapshot>,
 }
 
 // ---------------------------------------------------------------------------
@@ -148,11 +158,11 @@ pub struct Application {
     agents: HashMap<String, AgentClient>,
     /// Active sessions, keyed by session ID.
     sessions: HashMap<String, SessionState>,
-    /// Markdown backup file path keyed by session ID.
-    session_backup_paths: HashMap<String, PathBuf>,
-    /// Markdown render state keyed by session ID.
-    session_backup_render_state: HashMap<String, SessionBackupRenderState>,
-    /// Sender for session backup events; writer runs in background task.
+    /// Transcript file path keyed by session ID.
+    session_transcript_paths: HashMap<String, PathBuf>,
+    /// Transcript render state keyed by session ID.
+    session_transcript_state: HashMap<String, SessionTranscriptState>,
+    /// Sender for transcript events; writer runs in background task.
     backup_writer_tx: tokio::sync::mpsc::UnboundedSender<BackupWriterEvent>,
     /// Monotonically increasing ID for outgoing requests to agents.
     next_request_id: AtomicI64,
@@ -263,21 +273,21 @@ impl Application {
         }
     }
 
-    fn now_label() -> String {
-        fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
-            let z = days_since_epoch + 719_468;
-            let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-            let doe = z - era * 146_097;
-            let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-            let y = yoe + era * 400;
-            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-            let mp = (5 * doy + 2) / 153;
-            let d = doy - (153 * mp + 2) / 5 + 1;
-            let m = mp + if mp < 10 { 3 } else { -9 };
-            let year = y + if m <= 2 { 1 } else { 0 };
-            (year as i32, m as u32, d as u32)
-        }
+    fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
+        let z = days_since_epoch + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = mp + if mp < 10 { 3 } else { -9 };
+        let year = y + if m <= 2 { 1 } else { 0 };
+        (year as i32, m as u32, d as u32)
+    }
 
+    fn now_label() -> String {
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -287,31 +297,87 @@ impl Application {
         let hour = sod / 3_600;
         let minute = (sod % 3_600) / 60;
         let second = sod % 60;
-        let (year, month, day) = civil_from_days(days);
+        let (year, month, day) = Self::civil_from_days(days);
         format!(
             "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
             year, month, day, hour, minute, second
         )
     }
 
-    fn session_backup_file_path(cwd: &str, session_id: &str) -> PathBuf {
-        let safe_session_id = session_id.replace(['/', '\\', ':'], "_");
-        PathBuf::from(cwd)
-            .join(".acp-proxy")
-            .join(format!("{safe_session_id}.md"))
+    fn now_file_label() -> String {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let days = secs.div_euclid(86_400);
+        let sod = secs.rem_euclid(86_400);
+        let hour = sod / 3_600;
+        let minute = (sod % 3_600) / 60;
+        let second = sod % 60;
+        let (year, month, day) = Self::civil_from_days(days);
+        format!("{:04}-{:02}-{:02}-{:02}-{:02}-{:02}", year, month, day, hour, minute, second)
     }
 
-    fn init_session_backup(&mut self, session_id: &str, agent_name: &str, cwd: &str) {
-        let path = Self::session_backup_file_path(cwd, session_id);
+    fn session_transcript_file_path(cwd: &str, file_label: &str) -> PathBuf {
+        PathBuf::from(cwd)
+            .join(".agent-shell")
+            .join("transcripts")
+            .join(format!("{file_label}.md"))
+    }
+
+    fn ensure_gitignore(project_root: &str) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(project_root)
+            .arg("rev-parse")
+            .arg("--show-toplevel")
+            .output();
+        let Ok(output) = output else { return };
+        if !output.status.success() {
+            return;
+        }
+        let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if root.is_empty() {
+            return;
+        }
+        let ignore_status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .arg("check-ignore")
+            .arg("-q")
+            .arg(".agent-shell")
+            .status();
+        if ignore_status.map(|s| s.success()).unwrap_or(false) {
+            return;
+        }
+        let gitignore = PathBuf::from(&root).join(".gitignore");
+        let entry = "/.agent-shell/\n";
+        let already_has = std::fs::read_to_string(&gitignore)
+            .ok()
+            .map(|content| content.contains("/.agent-shell/"))
+            .unwrap_or(false);
+        if !already_has {
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&gitignore)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, entry.as_bytes()));
+        }
+    }
+
+    fn init_session_transcript(&mut self, session_id: &str, agent_name: &str, cwd: &str) {
+        let file_label = Self::now_file_label();
+        let path = Self::session_transcript_file_path(cwd, &file_label);
+        Self::ensure_gitignore(cwd);
         let ts = Self::now_label();
         let header = format!(
-            "# ACP Session Backup\n\n- session_id: `{}`\n- agent: `{}`\n- cwd: `{}`\n- started_at: `{}`\n\n---\n\n",
-            session_id, agent_name, cwd, ts
+            "# Agent Shell Transcript\n\n**Agent:** {}\n**Started:** {}\n**Working Directory:** {}\n\n---\n\n",
+            agent_name, ts, cwd
         );
-        self.session_backup_paths
+        self.session_transcript_paths
             .insert(session_id.to_string(), path.clone());
-        self.session_backup_render_state
-            .insert(session_id.to_string(), SessionBackupRenderState::default());
+        self.session_transcript_state
+            .insert(session_id.to_string(), SessionTranscriptState::default());
         self.enqueue_backup_append(path, header);
     }
 
@@ -324,8 +390,8 @@ impl Application {
         }
     }
 
-    fn append_session_backup(&self, session_id: &str, markdown: &str) {
-        let Some(path) = self.session_backup_paths.get(session_id) else {
+    fn append_session_transcript(&self, session_id: &str, markdown: &str) {
+        let Some(path) = self.session_transcript_paths.get(session_id) else {
             return;
         };
         self.enqueue_backup_append(path.clone(), markdown.to_string());
@@ -365,61 +431,186 @@ impl Application {
         }
     }
 
-    fn start_backup_message_if_needed(
+    fn indent_markdown_headers(text: &str) -> String {
+        let mut in_code_block: Option<usize> = None;
+        let mut out = Vec::new();
+        for line in text.split('\n') {
+            let backtick_run = line.chars().take_while(|c| *c == '`').count();
+            if backtick_run >= 3 {
+                if let Some(current) = in_code_block {
+                    if backtick_run >= current {
+                        in_code_block = None;
+                    }
+                } else {
+                    in_code_block = Some(backtick_run);
+                }
+                out.push(line.to_string());
+                continue;
+            }
+            if in_code_block.is_none() {
+                let hash_run = line.chars().take_while(|c| *c == '#').count();
+                if hash_run > 0 && line.chars().nth(hash_run) == Some(' ') {
+                    let new_level = std::cmp::min(6, hash_run + 2);
+                    let new_hashes = "#".repeat(new_level);
+                    let replaced = format!("{} {}", new_hashes, &line[(hash_run + 1)..]);
+                    out.push(replaced);
+                    continue;
+                }
+            }
+            out.push(line.to_string());
+        }
+        out.join("\n")
+    }
+
+    fn longest_backtick_run(text: &str) -> usize {
+        let mut max_run = 0;
+        let mut current = 0;
+        for ch in text.chars() {
+            if ch == '`' {
+                current += 1;
+                if current > max_run {
+                    max_run = current;
+                }
+            } else {
+                current = 0;
+            }
+        }
+        max_run
+    }
+
+    fn extract_tool_parameters(raw_input: Option<&serde_json::Value>) -> Option<String> {
+        let Some(raw_input) = raw_input else { return None };
+        let Some(obj) = raw_input.as_object() else { return None };
+        let excluded = ["command", "description", "plan"];
+        let mut lines = Vec::new();
+        for (k, v) in obj {
+            if excluded.contains(&k.as_str()) {
+                continue;
+            }
+            if v.is_null() {
+                continue;
+            }
+            if let Some(s) = v.as_str() {
+                if s.trim().is_empty() {
+                    continue;
+                }
+                lines.push(format!("{}: {}", k, s));
+                continue;
+            }
+            if let Some(n) = v.as_i64() {
+                lines.push(format!("{}: {}", k, n));
+                continue;
+            }
+            if let Some(n) = v.as_u64() {
+                lines.push(format!("{}: {}", k, n));
+                continue;
+            }
+            if let Some(n) = v.as_f64() {
+                lines.push(format!("{}: {}", k, n));
+                continue;
+            }
+            if let Some(b) = v.as_bool() {
+                lines.push(format!("{}: {}", k, if b { "true" } else { "false" }));
+                continue;
+            }
+            if let Ok(serialized) = serde_json::to_string(v) {
+                lines.push(format!("{}: {}", k, serialized));
+            }
+        }
+        if lines.is_empty() { None } else { Some(lines.join("\n")) }
+    }
+
+    fn make_tool_call_entry(
+        status: Option<&str>,
+        title: Option<&str>,
+        kind: Option<&str>,
+        description: Option<&str>,
+        command: Option<&str>,
+        parameters: Option<&str>,
+        output: &str,
+    ) -> String {
+        let trimmed = output.trim();
+        let fence_len = std::cmp::max(3, Self::longest_backtick_run(trimmed) + 1);
+        let fence = "`".repeat(fence_len);
+        let mut entry = String::new();
+        entry.push_str(&format!(
+            "\n\n### Tool Call [{}]: {}\n",
+            status.unwrap_or("no status"),
+            title.unwrap_or("")
+        ));
+        if let Some(kind) = kind {
+            if !kind.is_empty() {
+                entry.push_str(&format!("\n**Tool:** {}", kind));
+            }
+        }
+        entry.push_str(&format!("\n**Timestamp:** {}", Self::now_label()));
+        if let Some(description) = description {
+            if !description.is_empty() {
+                entry.push_str(&format!("\n**Description:** {}", description));
+            }
+        }
+        if let Some(command) = command {
+            if !command.is_empty() {
+                entry.push_str(&format!("\n**Command:** {}", command));
+            }
+        }
+        if let Some(parameters) = parameters {
+            if !parameters.is_empty() {
+                entry.push_str(&format!("\n**Parameters:**\n{}", parameters));
+            }
+        }
+        entry.push_str("\n\n");
+        entry.push_str(&fence);
+        entry.push('\n');
+        entry.push_str(trimmed);
+        entry.push('\n');
+        entry.push_str(&fence);
+        entry.push('\n');
+        entry
+    }
+
+    fn start_transcript_section_if_needed(
         &mut self,
         session_id: &str,
-        message_id: Option<&str>,
+        entry_type: &str,
         heading: &str,
     ) {
-        if let Some(mid) = message_id {
-            let needs_new_heading = self
-                .session_backup_render_state
-                .get(session_id)
-                .and_then(|s| s.last_message_id.as_deref())
-                != Some(mid);
-            if needs_new_heading {
-                let ts = Self::now_label();
-                let md = format!("\n## {} ({})\n\n", heading, ts);
-                self.append_session_backup(session_id, &md);
-                let state = self
-                    .session_backup_render_state
-                    .entry(session_id.to_string())
-                    .or_default();
-                state.last_message_id = Some(mid.to_string());
-            }
-        } else {
-            let ts = Self::now_label();
-            let md = format!("\n## {} ({})\n\n", heading, ts);
-            self.append_session_backup(session_id, &md);
+        let needs_new_heading = self
+            .session_transcript_state
+            .get(session_id)
+            .and_then(|s| s.last_entry_type.as_deref())
+            != Some(entry_type);
+        if needs_new_heading {
+            let md = format!("\n## {} ({})\n\n", heading, Self::now_label());
+            self.append_session_transcript(session_id, &md);
             let state = self
-                .session_backup_render_state
+                .session_transcript_state
                 .entry(session_id.to_string())
                 .or_default();
-            state.last_message_id = None;
+            state.last_entry_type = Some(entry_type.to_string());
         }
     }
 
-    fn backup_prompt_message(&mut self, session_id: &str, params: &serde_json::Value) {
+    fn transcript_prompt_message(&mut self, session_id: &str, params: &serde_json::Value) {
         let message = params.get("message").cloned().unwrap_or(serde_json::Value::Null);
         let text = Self::extract_text_from_value(&message);
-        self.start_backup_message_if_needed(session_id, None, "User");
-        let md = if text.is_empty() {
+        self.start_transcript_section_if_needed(session_id, "user_prompt", "User");
+        let body = if text.is_empty() {
             "_(empty prompt)_\n\n".to_string()
         } else {
-            format!("{}\n\n", text)
+            format!(
+                "{}\n\n",
+                Self::indent_markdown_headers(text.trim())
+            )
         };
-        self.append_session_backup(session_id, &md);
+        self.append_session_transcript(session_id, &body);
     }
 
-    fn backup_session_update(&mut self, session_id: &str, update: &serde_json::Value) {
+    fn transcript_session_update(&mut self, session_id: &str, update: &serde_json::Value) {
         let update_type = update
             .get("sessionUpdate")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        let message_id = update
-            .get("messageId")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
 
         match update_type {
             "agent_message_chunk" => {
@@ -431,8 +622,9 @@ impl Application {
                 if text.is_empty() {
                     return;
                 }
-                self.start_backup_message_if_needed(session_id, Some(message_id), "Assistant");
-                self.append_session_backup(session_id, text);
+                self.start_transcript_section_if_needed(session_id, "agent_message_chunk", "Agent");
+                let body = Self::indent_markdown_headers(text);
+                self.append_session_transcript(session_id, &body);
             }
             "agent_thought_chunk" => {
                 let text = update
@@ -443,31 +635,9 @@ impl Application {
                 if text.is_empty() {
                     return;
                 }
-                self.start_backup_message_if_needed(session_id, Some(message_id), "Thinking");
-                self.append_session_backup(session_id, text);
-            }
-            "tool_call" | "tool_call_update" => {
-                let title = update.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                let kind = update.get("kind").and_then(|v| v.as_str()).unwrap_or("tool");
-                let status = update.get("status").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let tool_heading = if title.is_empty() {
-                    format!("Tool: {}", kind)
-                } else {
-                    format!("Tool: {} ({})", title, kind)
-                };
-                self.start_backup_message_if_needed(session_id, Some(message_id), &tool_heading);
-
-                let mut line = format!("- status: {}", status);
-                if let Some(output) = update
-                    .get("rawOutput")
-                    .and_then(|v| v.get("output"))
-                    .and_then(|v| v.as_str())
-                {
-                    if !output.trim().is_empty() {
-                        line.push_str(&format!("\n  output: {}", output.trim()));
-                    }
-                }
-                self.append_session_backup(session_id, &format!("{}\n", line));
+                self.start_transcript_section_if_needed(session_id, "agent_thought_chunk", "Agent's Thoughts");
+                let body = Self::indent_markdown_headers(text);
+                self.append_session_transcript(session_id, &body);
             }
             "user_message_chunk" => {
                 let text = update
@@ -478,22 +648,95 @@ impl Application {
                 if text.is_empty() {
                     return;
                 }
-                self.start_backup_message_if_needed(session_id, Some(message_id), "User");
-                self.append_session_backup(session_id, text);
+                self.start_transcript_section_if_needed(session_id, "user_message_chunk", "User");
+                let body = format!(
+                    "> {}\n",
+                    Self::indent_markdown_headers(text)
+                );
+                self.append_session_transcript(session_id, &body);
             }
-            "plan" => {
-                self.start_backup_message_if_needed(session_id, Some(message_id), "Plan");
-                if let Some(entries) = update.get("entries").and_then(|v| v.as_array()) {
-                    for entry in entries {
-                        let text = if let Some(s) = entry.as_str() {
-                            s.to_string()
-                        } else if let Some(t) = entry.get("text").and_then(|v| v.as_str()) {
-                            t.to_string()
-                        } else {
-                            continue;
-                        };
-                        self.append_session_backup(session_id, &format!("- {}\n", text));
+            "tool_call" | "tool_call_update" => {
+                let tool_call_id = update
+                    .get("toolCallId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let status = update.get("status").and_then(|v| v.as_str());
+                let title = update.get("title").and_then(|v| v.as_str());
+                let kind = update.get("kind").and_then(|v| v.as_str());
+                let raw_input = update.get("rawInput");
+                let description = raw_input.and_then(|v| v.get("description")).and_then(|v| v.as_str());
+                let command = raw_input.and_then(|v| v.get("command")).and_then(|v| v.as_str());
+
+                let state = self
+                    .session_transcript_state
+                    .entry(session_id.to_string())
+                    .or_default();
+                state.last_entry_type = Some("tool_call".to_string());
+                if !tool_call_id.is_empty() {
+                    let snapshot = state.tool_calls.entry(tool_call_id.to_string()).or_default();
+                    if let Some(title) = title {
+                        if !title.is_empty() {
+                            snapshot.title = Some(title.to_string());
+                        }
                     }
+                    if let Some(kind) = kind {
+                        if !kind.is_empty() {
+                            snapshot.kind = Some(kind.to_string());
+                        }
+                    }
+                    if let Some(description) = description {
+                        if !description.is_empty() {
+                            snapshot.description = Some(description.to_string());
+                        }
+                    }
+                    if let Some(command) = command {
+                        if !command.is_empty() {
+                            snapshot.command = Some(command.to_string());
+                        }
+                    }
+                    if let Some(raw_input) = raw_input {
+                        snapshot.raw_input = Some(raw_input.clone());
+                    }
+                }
+
+                if matches!(status, Some("completed") | Some("failed")) {
+                    let output = update
+                        .get("content")
+                        .and_then(|v| v.as_array())
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|item| item.get("text").and_then(|v| v.as_str()))
+                                .collect::<Vec<_>>()
+                                .join("\n\n")
+                        })
+                        .unwrap_or_default();
+                    let output = format!("\n\n{}\n\n", output);
+
+                    let (snap_title, snap_kind, snap_desc, snap_cmd, snap_raw) = state
+                        .tool_calls
+                        .get(tool_call_id)
+                        .map(|s| {
+                            (
+                                s.title.as_deref(),
+                                s.kind.as_deref(),
+                                s.description.as_deref(),
+                                s.command.as_deref(),
+                                s.raw_input.as_ref(),
+                            )
+                        })
+                        .unwrap_or((None, None, None, None, None));
+                    let parameters = Self::extract_tool_parameters(snap_raw);
+                    let entry = Self::make_tool_call_entry(
+                        status,
+                        snap_title,
+                        snap_kind,
+                        snap_desc,
+                        snap_cmd,
+                        parameters.as_deref(),
+                        &output,
+                    );
+                    self.append_session_transcript(session_id, &entry);
                 }
             }
             _ => {}
@@ -555,8 +798,8 @@ impl Application {
             config,
             agents: HashMap::new(),
             sessions: HashMap::new(),
-            session_backup_paths: HashMap::new(),
-            session_backup_render_state: HashMap::new(),
+            session_transcript_paths: HashMap::new(),
+            session_transcript_state: HashMap::new(),
             backup_writer_tx,
             next_request_id: AtomicI64::new(1),
             pending_requests: HashMap::new(),
@@ -658,7 +901,7 @@ impl Application {
         if req.method == methods::PROMPT {
             if let Some(session_id) = req.params.get("sessionId").and_then(|v| v.as_str()) {
                 self.reset_session_stream_state(session_id);
-                self.backup_prompt_message(session_id, &req.params);
+                self.transcript_prompt_message(session_id, &req.params);
             }
             self.spawn_prompt(req.id.clone(), req.params.clone(), emacs_sender.clone());
             return Ok(());
@@ -817,7 +1060,7 @@ impl Application {
                         message_state: SessionMessageState::default(),
                     },
                 );
-                self.init_session_backup(&session_id_str, &agent_name, cwd);
+                self.init_session_transcript(&session_id_str, &agent_name, cwd);
 
                 // Build response with session info
                 let mut result = serde_json::json!({
@@ -934,6 +1177,9 @@ impl Application {
             }
         };
 
+        let transcript_path = self.session_transcript_paths.get(&session_id).cloned();
+        let backup_writer_tx = self.backup_writer_tx.clone();
+
         // --- spawn the actual ACP call on the local set ---
         tokio::task::spawn_local(async move {
             let acp_session_id = acp::SessionId::new(session_id.clone());
@@ -947,6 +1193,15 @@ impl Application {
                                 "sessionId".to_string(),
                                 serde_json::Value::String(session_id.clone()),
                             );
+                        }
+                        let stop_reason = val.get("stopReason").and_then(|v| v.as_str());
+                        if stop_reason == Some("end_turn") {
+                            if let Some(path) = transcript_path.clone() {
+                                let _ = backup_writer_tx.send(BackupWriterEvent::Append {
+                                    path,
+                                    content: "\n\n".to_string(),
+                                });
+                            }
                         }
                         Response::new_ok(id, val)
                     }
@@ -1270,7 +1525,7 @@ impl Application {
                 mut update,
             } => {
                 self.assign_message_id_for_update(&session_id, &mut update);
-                self.backup_session_update(&session_id, &update);
+                self.transcript_session_update(&session_id, &update);
                 Notification {
                     method: notifications::SESSION_UPDATE.into(),
                     params: serde_json::json!({
@@ -1339,9 +1594,9 @@ impl Application {
             } => {
                 // Clean up sessions associated with this agent
                 self.sessions.retain(|_, s| s.agent_name != agent_name);
-                self.session_backup_paths
+                self.session_transcript_paths
                     .retain(|session_id, _| self.sessions.contains_key(session_id));
-                self.session_backup_render_state
+                self.session_transcript_state
                     .retain(|session_id, _| self.sessions.contains_key(session_id));
                 self.agents.remove(&agent_name);
 

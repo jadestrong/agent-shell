@@ -41,6 +41,8 @@
 
 (defconst acp-package-version "0.11.1")
 (defconst acp--jsonrpc-version "2.0")
+(defconst acp-proxy-handles-transcripts t
+  "Non-nil when transcripts are written by the ACP proxy.")
 
 (defvar acp-logging-enabled nil)
 (defvar acp-instance-count 0)
@@ -238,21 +240,24 @@ Other arguments match acp.el semantics."
       (setq acp--shared-config-file path)
       path)))
 
-(defun acp--jsonrpc-request (client method params &optional callback error-callback)
+(cl-defun acp--jsonrpc-request (client method params &optional callback error-callback (timeout :default))
   "Send JSON-RPC request to proxy for CLIENT." 
   (if (or callback error-callback)
-      (jsonrpc-async-request
-       (map-elt client :connection)
-       (intern method)
-       params
-       :success-fn (if callback
-                       (lambda (result)
-                         (funcall callback (acp--normalize-object result)))
-                     #'ignore)
-       :error-fn (if error-callback
-                     (lambda (err)
-                       (funcall error-callback (acp--normalize-object err)))
-                   #'ignore))
+      (apply #'jsonrpc-async-request
+             (map-elt client :connection)
+             (intern method)
+             params
+             :success-fn (if callback
+                             (lambda (result)
+                               (funcall callback (acp--normalize-object result)))
+                           #'ignore)
+             :error-fn (if error-callback
+                           (lambda (err)
+                             (funcall error-callback (acp--normalize-object err)))
+                         #'ignore)
+             (if (eq timeout :default)
+                 '()
+               (list :timeout timeout)))
     (acp--normalize-object
      (jsonrpc-request (map-elt client :connection) (intern method) params))))
 
