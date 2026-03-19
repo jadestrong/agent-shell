@@ -60,6 +60,53 @@
 (defvar acp--shared-clients 0
   "Number of live clients attached to the shared proxy.")
 
+(defvar acp--shared-client-list nil
+  "List of clients attached to the shared proxy.")
+
+(defun acp--shared-register-client (client)
+  "Register CLIENT with the shared proxy."
+  (setq acp--shared-client-list (cons client (delq client acp--shared-client-list))))
+
+(defun acp--shared-unregister-client (client)
+  "Unregister CLIENT from the shared proxy."
+  (setq acp--shared-client-list (delq client acp--shared-client-list)))
+
+(defun acp--shared-target-clients (method params)
+  "Return shared clients that should handle METHOD with PARAMS."
+  (let* ((method-name (if (symbolp method) (symbol-name method) method))
+         (session-id (acp--get params 'sessionId))
+         (clients acp--shared-client-list))
+    (cl-labels
+        ((client-session-id (client)
+           (or (map-elt client :session-id)
+               (when-let ((buf (map-elt client :context-buffer))
+                          ((buffer-live-p buf)))
+                 (with-current-buffer buf
+                   (when (and (boundp 'agent-shell--state)
+                              (bound-and-true-p agent-shell--state))
+                     (map-nested-elt agent-shell--state '(:session :id))))))))
+    (cond
+     ((and session-id
+           (member method-name '("acp/sessionUpdate" "acp/permissionRequest")))
+      (or (seq-filter (lambda (client)
+                        (equal (client-session-id client) session-id))
+                      clients)
+          nil))
+     (t clients)))))
+
+(defun acp--shared-dispatch-notification (method params)
+  "Dispatch a proxy notification to the appropriate shared client(s)."
+  (let ((clients (acp--shared-target-clients method params)))
+    (dolist (client (or clients acp--shared-client-list))
+      (acp--jsonrpc-notification-dispatcher client method params))))
+
+(defun acp--shared-dispatch-request (method params)
+  "Dispatch a proxy request to a single appropriate shared client."
+  (let* ((clients (acp--shared-target-clients method params))
+         (client (or (car clients) (car acp--shared-client-list))))
+    (when client
+      (acp--jsonrpc-request-dispatcher client method params))))
+
 ;; ---------------------------------------------------------------------------
 ;; Customization
 ;; ---------------------------------------------------------------------------
@@ -250,6 +297,7 @@ Other arguments match acp.el semantics."
            (jsonrpc-running-p acp--shared-connection))
       (progn
         (setq acp--shared-clients (1+ acp--shared-clients))
+        (acp--shared-register-client client)
         (map-put! client :connection acp--shared-connection)
         (map-put! client :process acp--shared-process))
     (let* ((timestamp (format-time-string "%Y%m%d%H%M%S"))
@@ -288,15 +336,16 @@ Other arguments match acp.el semantics."
                        :stderr stderr-proc))
                     :notification-dispatcher
                     (lambda (_conn method params)
-                      (acp--jsonrpc-notification-dispatcher client method params))
+                      (acp--shared-dispatch-notification method params))
                     :request-dispatcher
                     (lambda (_conn method params)
-                      (acp--jsonrpc-request-dispatcher client method params))
+                      (acp--shared-dispatch-request method params))
                     :on-shutdown (lambda (connection)
                                    (acp--process-sentinel client connection)))))
         (setq acp--shared-connection conn)
         (setq acp--shared-process (jsonrpc--process conn))
         (setq acp--shared-clients 1)
+        (setq acp--shared-client-list (list client))
         (map-put! client :connection acp--shared-connection)
         (map-put! client :process acp--shared-process)))))
 
@@ -311,6 +360,7 @@ Other arguments match acp.el semantics."
     (setq acp--shared-connection nil)
     (setq acp--shared-process nil)
     (setq acp--shared-clients 0)
+    (setq acp--shared-client-list nil)
     (map-put! client :proxy-connected nil)
     (map-put! client :connection nil)
     (map-put! client :process nil)))
@@ -321,6 +371,7 @@ Other arguments match acp.el semantics."
     (error ":client is required"))
   (when (acp--client-started-p client)
     (setq acp--shared-clients (max 0 (1- acp--shared-clients)))
+    (acp--shared-unregister-client client)
     (when (and (<= acp--shared-clients 0)
                acp--shared-connection)
       (jsonrpc-shutdown acp--shared-connection))
