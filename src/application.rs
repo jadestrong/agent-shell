@@ -876,11 +876,16 @@ impl Application {
     ) -> Result<()> {
         match msg {
             Message::Request(req) => {
-                tracing::info!("Received request: {} (id={})", req.method, req.id);
+                tracing::info!(
+                    "Received request: {} (id={} params={})",
+                    req.method,
+                    req.id,
+                    req.params
+                );
                 self.handle_request(req, emacs_sender).await?;
             }
             Message::Notification(notif) => {
-                tracing::info!("Received notification: {}", notif.method);
+                tracing::info!("Received notification: {} params={}", notif.method, notif.params);
                 self.handle_notification(notif)?;
             }
             Message::Response(resp) => {

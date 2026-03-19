@@ -57,17 +57,8 @@
 (defvar acp--shared-process nil
   "Shared proxy process.")
 
-(defvar acp--shared-config-file nil
-  "Path to the shared proxy config file.")
-
 (defvar acp--shared-clients 0
   "Number of live clients attached to the shared proxy.")
-
-(defvar acp--shared-agents (make-hash-table :test 'equal)
-  "Hash table of agent specs keyed by agent name.")
-
-(defvar acp--shared-active-agents (make-hash-table :test 'equal)
-  "Agent names loaded in the currently running shared proxy.")
 
 ;; ---------------------------------------------------------------------------
 ;; Customization
@@ -90,6 +81,13 @@
 (defcustom acp-log-file-directory temporary-file-directory
   "The directory for `lsp-proxy' server to generate log file."
   :type 'string
+  :group 'acp)
+
+;; Optional explicit proxy config file. When nil, the proxy uses its default.
+(defcustom acp-proxy-config-file nil
+  "Explicit config file path for the ACP proxy, or nil to use the default."
+  :type '(choice (const :tag "Default config" nil)
+                 (file :tag "Config file path"))
   :group 'acp)
 
 ;; Timeout for long-running prompt requests (nil disables).
@@ -161,7 +159,7 @@ Other arguments match acp.el semantics."
         (cons :response-sender (or response-sender #'acp--response-sender))
         (cons :outgoing-request-decorator outgoing-request-decorator)
         (cons :proxy-program (or proxy-program acp-proxy-program))
-        (cons :proxy-config-file proxy-config-file)
+        (cons :proxy-config-file (or proxy-config-file acp-proxy-config-file))
         (cons :agent-name agent-name)
         (cons :proxy-connected nil)
         (cons :connect-result nil)
@@ -198,54 +196,6 @@ Other arguments match acp.el semantics."
   (list :command (map-elt client :command)
         :args (map-elt client :command-params)
         :env (acp--env-alist (map-elt client :environment-variables))))
-
-(defun acp--register-agent (client)
-  "Register CLIENT agent spec in the shared registry."
-  (let* ((agent-name (acp--agent-name client))
-         (spec (acp--agent-spec client))
-         (existing (gethash agent-name acp--shared-agents)))
-    (when (and existing (not (equal existing spec)))
-      (error "Conflicting agent spec for %s in shared proxy" agent-name))
-    (puthash agent-name spec acp--shared-agents)
-    agent-name))
-
-(defun acp--write-shared-config ()
-  "Write shared proxy config for all registered agents."
-  (let* ((dir (file-name-as-directory (expand-file-name acp-temp-dir))))
-    (make-directory dir t)
-    (let* ((path (or acp--shared-config-file
-                     (make-temp-file (expand-file-name "agents-" dir) nil ".toml"))))
-      (with-temp-buffer
-        (insert (format "log_level = \"%s\"\n\n" acp-log-level))
-        (maphash
-         (lambda (agent-name spec)
-           (let ((cmd (plist-get spec :command))
-                 (args (plist-get spec :args))
-                 (env (plist-get spec :env)))
-             (insert (format "[agents.%s]\n" agent-name))
-             (when cmd
-               (insert (format "command = \"%s\"\n"
-                               (replace-regexp-in-string "\\\"" "\\\\\"" cmd))))
-             (when args
-               (insert "args = [")
-               (insert (mapconcat (lambda (a)
-                                    (format "\"%s\"" (replace-regexp-in-string "\\\"" "\\\\\"" a)))
-                                  args
-                                  ", "))
-               (insert "]\n"))
-             (when env
-               (insert "env = { ")
-               (insert (mapconcat (lambda (pair)
-                                    (format "\"%s\" = \"%s\""
-                                            (car pair)
-                                            (replace-regexp-in-string "\\\"" "\\\\\"" (cdr pair))))
-                                  env
-                                  ", "))
-               (insert " }\n"))))
-         acp--shared-agents)
-        (write-region (point-min) (point-max) path nil 'quiet))
-      (setq acp--shared-config-file path)
-      path)))
 
 (cl-defun acp--jsonrpc-request (client method params &optional callback error-callback (timeout :default))
   "Send JSON-RPC request to proxy for CLIENT." 
@@ -286,26 +236,17 @@ Other arguments match acp.el semantics."
 
 (cl-defun acp--start-client (&key client)
   "Start CLIENT." 
-  (message "here?")
   (unless client
     (error ":client is required"))
   (unless (or (map-elt client :command) (map-elt client :agent-name))
     (error ":command (or :agent-name) is required"))
-  (when (and (not (map-elt client :command))
-             (not (map-elt client :proxy-config-file)))
-    (error ":proxy-config-file is required when :command is nil"))
   (when (acp--client-started-p client)
     (error "Client already started"))
-  (acp--register-agent client)
   (if (and acp--shared-connection
            acp--shared-process
            (process-live-p acp--shared-process)
            (jsonrpc-running-p acp--shared-connection))
       (progn
-        (let ((agent-name (acp--agent-name client)))
-          (unless (gethash agent-name acp--shared-active-agents)
-            (error "Agent %s not loaded in shared proxy; restart proxy to add it"
-                   agent-name)))
         (setq acp--shared-clients (1+ acp--shared-clients))
         (map-put! client :connection acp--shared-connection)
         (map-put! client :process acp--shared-process))
@@ -313,10 +254,7 @@ Other arguments match acp.el semantics."
            (random-num (random 100000))
            (filename (format "acp-%s-%05d.log" timestamp random-num))
            (proxy-program (map-elt client :proxy-program))
-           (proxy-config (or (map-elt client :proxy-config-file)
-                             (acp--write-shared-config)))
-           (_ (setq acp--shared-config-file proxy-config))
-           (_ (map-put! client :proxy-config-file proxy-config))
+           (proxy-config (map-elt client :proxy-config-file))
            (stderr-buffer (get-buffer-create "*acp-stderr(shared)*"))
            (stderr-proc (make-pipe-process
                          :name "acp-stderr(shared)"
@@ -332,15 +270,17 @@ Other arguments match acp.el semantics."
                                      (dolist (handler (map-elt client :error-handlers))
                                        (funcall handler std-error)))))))
       (setq acp--log-file (concat acp-log-file-directory filename))
-      (let ((conn (jsonrpc-process-connection
+      (let* ((proxy-args (append (list "--stdio" "--log-level" acp-log-level)
+                                (when proxy-config
+                                  (list "--config" proxy-config))
+                                (list "--log-file" acp--log-file)))
+            (conn (jsonrpc-process-connection
                    :name "acp-shared"
                    :process
                    (lambda (_connection)
                      (make-process
                       :name "acp-shared"
-                      :command (cons proxy-program (list "--stdio" "--log-level" acp-log-level
-                                                         "--config" proxy-config
-                                                         "--log-file" acp--log-file))
+                      :command (cons proxy-program proxy-args)
                       :connection-type 'pipe
                       :noquery t
                       :stderr stderr-proc))
@@ -355,9 +295,6 @@ Other arguments match acp.el semantics."
         (setq acp--shared-connection conn)
         (setq acp--shared-process (jsonrpc--process conn))
         (setq acp--shared-clients 1)
-        (clrhash acp--shared-active-agents)
-        (maphash (lambda (k _v) (puthash k t acp--shared-active-agents))
-                 acp--shared-agents)
         (map-put! client :connection acp--shared-connection)
         (map-put! client :process acp--shared-process)))))
 
@@ -372,7 +309,6 @@ Other arguments match acp.el semantics."
     (setq acp--shared-connection nil)
     (setq acp--shared-process nil)
     (setq acp--shared-clients 0)
-    (clrhash acp--shared-active-agents)
     (map-put! client :proxy-connected nil)
     (map-put! client :connection nil)
     (map-put! client :process nil)))
