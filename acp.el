@@ -92,6 +92,13 @@
   :type 'string
   :group 'acp)
 
+;; Timeout for long-running prompt requests (nil disables).
+(defcustom acp-prompt-timeout nil
+  "Timeout in seconds for prompt requests, or nil to disable."
+  :type '(choice (const :tag "No timeout" nil)
+          (number :tag "Seconds"))
+  :group 'acp)
+
 ;; (defcustom acp-log-file nil
 ;;   "Path to the ACP Proxy log file. When nil, log to stderr."
 ;;   :type '(choice (const :tag "Stderr (default)" nil)
@@ -603,210 +610,214 @@ When non-nil SYNC, send notification synchronously."
                 (funcall on-success (if result-mapper (funcall result-mapper result) result)))))
           (cl-return-from acp--request-sender nil))))
     (acp--ensure-connected client)
-    (if sync
-        (condition-case err
-            (let* ((result (acp--jsonrpc-request client proxy-method proxy-params))
-                   (mapped (if result-mapper (funcall result-mapper result) result)))
-              mapped)
-          (error
-           (let ((err-obj `((code . -32603) (message . ,(error-message-string err)))))
-             (if on-failure
-                 (with-temp-buffer
-                   (with-current-buffer (or buffer (map-elt client :context-buffer) (current-buffer))
-                     (funcall on-failure err-obj)))
-               (error "ACP request failed: %s" err-obj)))))
-      (acp--jsonrpc-request
-       client
-       proxy-method
-       proxy-params
-       (when on-success
-         (lambda (result)
-           (with-temp-buffer
-             (with-current-buffer (or buffer (map-elt client :context-buffer) (current-buffer))
-               (funcall on-success (if result-mapper (funcall result-mapper result) result))))))
-       (when on-failure
-         (lambda (err)
-           (with-temp-buffer
-             (with-current-buffer (or buffer (map-elt client :context-buffer) (current-buffer))
-               (funcall on-failure err))))))))
+    (let ((timeout (if (string= proxy-method "acp/prompt")
+                       acp-prompt-timeout
+                     :default)))
+      (if sync
+          (condition-case err
+              (let* ((result (acp--jsonrpc-request client proxy-method proxy-params nil nil timeout))
+                     (mapped (if result-mapper (funcall result-mapper result) result)))
+                mapped)
+            (error
+             (let ((err-obj `((code . -32603) (message . ,(error-message-string err)))))
+               (if on-failure
+                   (with-temp-buffer
+                     (with-current-buffer (or buffer (map-elt client :context-buffer) (current-buffer))
+                       (funcall on-failure err-obj)))
+                 (error "ACP request failed: %s" err-obj)))))
+        (acp--jsonrpc-request
+         client
+         proxy-method
+         proxy-params
+         (when on-success
+           (lambda (result)
+             (with-temp-buffer
+               (with-current-buffer (or buffer (map-elt client :context-buffer) (current-buffer))
+                 (funcall on-success (if result-mapper (funcall result-mapper result) result))))))
+         (when on-failure
+           (lambda (err)
+             (with-temp-buffer
+               (with-current-buffer (or buffer (map-elt client :context-buffer) (current-buffer))
+                 (funcall on-failure err)))))
+         timeout)))))
 
-  (cl-defun acp--notification-sender (&key client notification sync)
-    "Send NOTIFICATION from CLIENT via proxy." 
-    (let* ((method (map-elt notification :method))
-           (params (map-elt notification :params)))
-      (pcase method
-        ("session/cancel"
-         (if sync
-             (acp--jsonrpc-request
-              client "acp/cancel"
-              (list :sessionId (acp--get params 'sessionId)
-                    :reason (acp--get params 'reason)))
+(cl-defun acp--notification-sender (&key client notification sync)
+  "Send NOTIFICATION from CLIENT via proxy." 
+  (let* ((method (map-elt notification :method))
+         (params (map-elt notification :params)))
+    (pcase method
+      ("session/cancel"
+       (if sync
            (acp--jsonrpc-request
             client "acp/cancel"
             (list :sessionId (acp--get params 'sessionId)
-                  :reason (acp--get params 'reason))
-            #'ignore #'ignore)))
-        (_
-         (acp--log client "NOTIFICATION" "Unsupported notification: %s" method)))))
-
-  (cl-defun acp-send-response (&key client response)
-    "Send a request RESPONSE from CLIENT." 
-    (unless client
-      (error ":client is required"))
-    (unless response
-      (error ":response is required"))
-    (let* ((request-id (map-elt response :request-id))
-           (pending (and request-id
-                         (gethash request-id (map-elt client :pending-incoming-responses)))))
-      (if pending
-          (progn
-            (setcar pending t)
-            (setcdr pending response))
-        (funcall (map-elt client :response-sender)
-                 :client client
-                 :response response))))
-
-  (defun acp--extract-permission-outcome (response)
-    "Extract (OUTCOME OPTION-ID) from RESPONSE." 
-    (let* ((result (map-elt response :result))
-           (outcome (or (acp--get result 'outcome) result))
-           (outcome-type (or (acp--get outcome 'outcome)
-                             (acp--get outcome 'status)))
-           (option-id (acp--get outcome 'optionId)))
-      (list outcome-type option-id)))
-
-  (defun acp--select-option-id (options)
-    "Pick a best-effort option id from OPTIONS list." 
-    (let ((opts (if (vectorp options) (append options nil) options))
-          (fallback nil))
-      (dolist (opt opts)
-        (let* ((opt-id (or (acp--get opt 'id)
-                           (acp--get opt 'optionId)))
-               (label (or (acp--get opt 'label)
-                          (acp--get opt 'title)
-                          "")))
-          (setq fallback (or fallback opt-id))
-          (when (and opt-id (string-match-p "\`\(reject\|deny\|cancel\)\'" (downcase opt-id)))
-            (cl-return-from acp--select-option-id opt-id))
-          (when (and opt-id (string-match-p "reject\|deny\|cancel" (downcase label)))
-            (cl-return-from acp--select-option-id opt-id))))
-      fallback))
-
-  (cl-defun acp--response-sender (&key client response)
-    "Send a request RESPONSE from CLIENT." 
-    (let* ((request-id (map-elt response :request-id))
-           (pending (and request-id
-                         (gethash request-id (map-elt client :pending-permission-requests)))))
-      (if (not pending)
-          (acp--log client "RESPONSE" "Unhandled response id: %s" request-id)
-        (let* ((outcome (acp--extract-permission-outcome response))
-               (outcome-type (car outcome))
-               (option-id (cadr outcome))
-               (options (plist-get pending :options))
-               (option-id (or option-id
-                              (when (and outcome-type (string= outcome-type "cancelled"))
-                                (acp--select-option-id options))
-                              (acp--select-option-id options))))
-          (remhash request-id (map-elt client :pending-permission-requests))
-          (acp--jsonrpc-request
-           client
-           "acp/respondPermission"
-           (list :requestId (plist-get pending :requestId)
-                 :sessionId (plist-get pending :sessionId)
-                 :optionId option-id)
-           #'ignore #'ignore)))))
-
-  (defun acp--next-incoming-request-id (client)
-    "Return a fresh ACP request id for incoming proxy requests." 
-    (let ((next (1+ (or (map-elt client :incoming-request-id) 0))))
-      (map-put! client :incoming-request-id next)
-      (format "req-%s" next)))
-
-  (defun acp--await-incoming-response (client request-id waiter)
-    "Wait for a RESPONSE to REQUEST-ID and return it." 
-    (while (and (not (car waiter))
-                (process-live-p (map-elt client :process)))
-      (accept-process-output nil 0.05))
-    (let ((response (cdr waiter)))
-      (remhash request-id (map-elt client :pending-incoming-responses))
-      response))
-
-  ;; ---------------------------------------------------------------------------
-  ;; Incoming proxy notifications -> ACP-compatible dispatch
-  ;; ---------------------------------------------------------------------------
-
-  (defun acp--dispatch-notification (client method params)
-    "Dispatch an ACP-compatible notification to CLIENT handlers." 
-    (let ((notification `((jsonrpc . ,acp--jsonrpc-version)
-                          (method . ,method)
-                          (params . ,params))))
-      (dolist (handler (map-elt client :notification-handlers))
-        (condition-case-unless-debug err
-            (funcall handler notification)
-          (error (acp--log client "NOTIFICATION HANDLER ERROR" "%S" err))))))
-
-  (defun acp--dispatch-request (client method params request-id)
-    "Dispatch an ACP-compatible request to CLIENT handlers." 
-    (let ((request `((jsonrpc . ,acp--jsonrpc-version)
-                     (method . ,method)
-                     (id . ,request-id)
-                     (params . ,params))))
-      (dolist (handler (map-elt client :request-handlers))
-        (condition-case-unless-debug err
-            (funcall handler request)
-          (error (acp--log client "REQUEST HANDLER ERROR" "%S" err))))))
-
-  (defun acp--jsonrpc-notification-dispatcher (client method params)
-    "Handle incoming JSON-RPC notification METHOD with PARAMS." 
-    (pcase (if (symbolp method) (symbol-name method) method)
-      ("acp/sessionUpdate"
-       (acp--dispatch-notification
-        client "session/update" (acp--normalize-object params)))
-      ("acp/permissionRequest"
-       (let* ((normalized (acp--normalize-object params))
-              (request-id (format "perm-%s" (map-elt client :request-id)))
-              (session-id (acp--get normalized 'sessionId))
-              (proxy-request-id (acp--get normalized 'requestId))
-              (options (acp--get normalized 'options)))
-         (map-put! client :request-id (1+ (map-elt client :request-id)))
-         (puthash request-id
-                  (list :requestId proxy-request-id
-                        :sessionId session-id
-                        :options options)
-                  (map-elt client :pending-permission-requests))
-         (acp--dispatch-request
-          client
-          "session/request_permission"
-          normalized
-          request-id)))
-      ("acp/authRequired"
-       (acp--dispatch-notification client "auth/required" (acp--normalize-object params)))
-      ("acp/agentDisconnected"
-       (acp--dispatch-notification client "agent/disconnected" (acp--normalize-object params)))
-      ("acp/fileChanged"
-       (acp--dispatch-notification client "fs/file_changed" (acp--normalize-object params)))
+                  :reason (acp--get params 'reason)))
+         (acp--jsonrpc-request
+          client "acp/cancel"
+          (list :sessionId (acp--get params 'sessionId)
+                :reason (acp--get params 'reason))
+          #'ignore #'ignore)))
       (_
-       (acp--dispatch-notification client
-                                   (acp--normalize-method method)
-                                   (acp--normalize-object params)))))
+       (acp--log client "NOTIFICATION" "Unsupported notification: %s" method)))))
 
-  (defun acp--jsonrpc-request-dispatcher (client method params)
-    "Handle incoming JSON-RPC request METHOD with PARAMS." 
-    (let* ((method-name (acp--normalize-method method))
-           (normalized (acp--normalize-object params))
-           (request-id (acp--next-incoming-request-id client))
-           (waiter (cons nil nil)))
-      (puthash request-id waiter (map-elt client :pending-incoming-responses))
-      (acp--dispatch-request client method-name normalized request-id)
-      (let ((response (acp--await-incoming-response client request-id waiter)))
-        (unless response
-          (jsonrpc-error :code -32603
-                         :message (format "No response for %s" method-name)))
-        (if-let ((err (acp--get response 'error)))
-            (jsonrpc-error :code (or (acp--get err 'code) -32603)
-                           :message (or (acp--get err 'message) "Internal error")
-                           :data (acp--get err 'data))
-          (acp--get response 'result))))))
+(cl-defun acp-send-response (&key client response)
+  "Send a request RESPONSE from CLIENT." 
+  (unless client
+    (error ":client is required"))
+  (unless response
+    (error ":response is required"))
+  (let* ((request-id (map-elt response :request-id))
+         (pending (and request-id
+                       (gethash request-id (map-elt client :pending-incoming-responses)))))
+    (if pending
+        (progn
+          (setcar pending t)
+          (setcdr pending response))
+      (funcall (map-elt client :response-sender)
+               :client client
+               :response response))))
+
+(defun acp--extract-permission-outcome (response)
+  "Extract (OUTCOME OPTION-ID) from RESPONSE." 
+  (let* ((result (map-elt response :result))
+         (outcome (or (acp--get result 'outcome) result))
+         (outcome-type (or (acp--get outcome 'outcome)
+                           (acp--get outcome 'status)))
+         (option-id (acp--get outcome 'optionId)))
+    (list outcome-type option-id)))
+
+(defun acp--select-option-id (options)
+  "Pick a best-effort option id from OPTIONS list." 
+  (let ((opts (if (vectorp options) (append options nil) options))
+        (fallback nil))
+    (dolist (opt opts)
+      (let* ((opt-id (or (acp--get opt 'id)
+                         (acp--get opt 'optionId)))
+             (label (or (acp--get opt 'label)
+                        (acp--get opt 'title)
+                        "")))
+        (setq fallback (or fallback opt-id))
+        (when (and opt-id (string-match-p "\`\(reject\|deny\|cancel\)\'" (downcase opt-id)))
+          (cl-return-from acp--select-option-id opt-id))
+        (when (and opt-id (string-match-p "reject\|deny\|cancel" (downcase label)))
+          (cl-return-from acp--select-option-id opt-id))))
+    fallback))
+
+(cl-defun acp--response-sender (&key client response)
+  "Send a request RESPONSE from CLIENT." 
+  (let* ((request-id (map-elt response :request-id))
+         (pending (and request-id
+                       (gethash request-id (map-elt client :pending-permission-requests)))))
+    (if (not pending)
+        (acp--log client "RESPONSE" "Unhandled response id: %s" request-id)
+      (let* ((outcome (acp--extract-permission-outcome response))
+             (outcome-type (car outcome))
+             (option-id (cadr outcome))
+             (options (plist-get pending :options))
+             (option-id (or option-id
+                            (when (and outcome-type (string= outcome-type "cancelled"))
+                              (acp--select-option-id options))
+                            (acp--select-option-id options))))
+        (remhash request-id (map-elt client :pending-permission-requests))
+        (acp--jsonrpc-request
+         client
+         "acp/respondPermission"
+         (list :requestId (plist-get pending :requestId)
+               :sessionId (plist-get pending :sessionId)
+               :optionId option-id)
+         #'ignore #'ignore)))))
+
+(defun acp--next-incoming-request-id (client)
+  "Return a fresh ACP request id for incoming proxy requests." 
+  (let ((next (1+ (or (map-elt client :incoming-request-id) 0))))
+    (map-put! client :incoming-request-id next)
+    (format "req-%s" next)))
+
+(defun acp--await-incoming-response (client request-id waiter)
+  "Wait for a RESPONSE to REQUEST-ID and return it." 
+  (while (and (not (car waiter))
+              (process-live-p (map-elt client :process)))
+    (accept-process-output nil 0.05))
+  (let ((response (cdr waiter)))
+    (remhash request-id (map-elt client :pending-incoming-responses))
+    response))
+
+;; ---------------------------------------------------------------------------
+;; Incoming proxy notifications -> ACP-compatible dispatch
+;; ---------------------------------------------------------------------------
+
+(defun acp--dispatch-notification (client method params)
+  "Dispatch an ACP-compatible notification to CLIENT handlers." 
+  (let ((notification `((jsonrpc . ,acp--jsonrpc-version)
+                        (method . ,method)
+                        (params . ,params))))
+    (dolist (handler (map-elt client :notification-handlers))
+      (condition-case-unless-debug err
+          (funcall handler notification)
+        (error (acp--log client "NOTIFICATION HANDLER ERROR" "%S" err))))))
+
+(defun acp--dispatch-request (client method params request-id)
+  "Dispatch an ACP-compatible request to CLIENT handlers." 
+  (let ((request `((jsonrpc . ,acp--jsonrpc-version)
+                   (method . ,method)
+                   (id . ,request-id)
+                   (params . ,params))))
+    (dolist (handler (map-elt client :request-handlers))
+      (condition-case-unless-debug err
+          (funcall handler request)
+        (error (acp--log client "REQUEST HANDLER ERROR" "%S" err))))))
+
+(defun acp--jsonrpc-notification-dispatcher (client method params)
+  "Handle incoming JSON-RPC notification METHOD with PARAMS." 
+  (pcase (if (symbolp method) (symbol-name method) method)
+    ("acp/sessionUpdate"
+     (acp--dispatch-notification
+      client "session/update" (acp--normalize-object params)))
+    ("acp/permissionRequest"
+     (let* ((normalized (acp--normalize-object params))
+            (request-id (format "perm-%s" (map-elt client :request-id)))
+            (session-id (acp--get normalized 'sessionId))
+            (proxy-request-id (acp--get normalized 'requestId))
+            (options (acp--get normalized 'options)))
+       (map-put! client :request-id (1+ (map-elt client :request-id)))
+       (puthash request-id
+                (list :requestId proxy-request-id
+                      :sessionId session-id
+                      :options options)
+                (map-elt client :pending-permission-requests))
+       (acp--dispatch-request
+        client
+        "session/request_permission"
+        normalized
+        request-id)))
+    ("acp/authRequired"
+     (acp--dispatch-notification client "auth/required" (acp--normalize-object params)))
+    ("acp/agentDisconnected"
+     (acp--dispatch-notification client "agent/disconnected" (acp--normalize-object params)))
+    ("acp/fileChanged"
+     (acp--dispatch-notification client "fs/file_changed" (acp--normalize-object params)))
+    (_
+     (acp--dispatch-notification client
+                                 (acp--normalize-method method)
+                                 (acp--normalize-object params)))))
+
+(defun acp--jsonrpc-request-dispatcher (client method params)
+  "Handle incoming JSON-RPC request METHOD with PARAMS." 
+  (let* ((method-name (acp--normalize-method method))
+         (normalized (acp--normalize-object params))
+         (request-id (acp--next-incoming-request-id client))
+         (waiter (cons nil nil)))
+    (puthash request-id waiter (map-elt client :pending-incoming-responses))
+    (acp--dispatch-request client method-name normalized request-id)
+    (let ((response (acp--await-incoming-response client request-id waiter)))
+      (unless response
+        (jsonrpc-error :code -32603
+                       :message (format "No response for %s" method-name)))
+      (if-let ((err (acp--get response 'error)))
+          (jsonrpc-error :code (or (acp--get err 'code) -32603)
+                         :message (or (acp--get err 'message) "Internal error")
+                         :data (acp--get err 'data))
+        (acp--get response 'result)))))
 
 (defun acp--normalize-method (method)
   "Return METHOD as a string." 
