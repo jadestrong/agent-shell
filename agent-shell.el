@@ -1434,30 +1434,9 @@ COMMAND, when present, may be a shell command string or an argv vector."
   "Return non-nil if STATE has in-flight requests awaiting responses."
   (map-elt state :active-requests))
 
-(defun agent-shell--buffer-for-session (session-id)
-  "Return agent shell buffer whose session id matches SESSION-ID."
-  (seq-find
-   (lambda (buf)
-     (with-current-buffer buf
-       (equal (map-nested-elt agent-shell--state '(:session :id)) session-id)))
-   (agent-shell-buffers)))
-
 (cl-defun agent-shell--on-notification (&key state acp-notification)
   "Handle incoming ACP-NOTIFICATION using STATE."
   (cond ((equal (map-elt acp-notification 'method) "session/update")
-         (let ((notification-session-id (map-nested-elt acp-notification '(params sessionId)))
-               (state-session-id (map-nested-elt state '(:session :id))))
-           ;; Ignore updates from other sessions (e.g. another shell buffer).
-           (when (and notification-session-id
-                      state-session-id
-                      (not (equal notification-session-id state-session-id)))
-             (when-let ((target-buffer (agent-shell--buffer-for-session notification-session-id)))
-               (with-current-buffer target-buffer
-                 (agent-shell--on-notification
-                  :state (buffer-local-value 'agent-shell--state target-buffer)
-                  :acp-notification acp-notification))
-               (cl-return-from agent-shell--on-notification nil))
-             (cl-return-from agent-shell--on-notification nil)))
          (cond
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "tool_call")
            ;; Notification is out of context (session/prompt finished).
