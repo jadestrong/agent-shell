@@ -30,8 +30,8 @@
 ;; `agent-shell' currently provides access to Claude Code, Cursor,
 ;; Gemini CLI, Goose, Codex, OpenCode, Qwen, and Auggie amongst other agents.
 ;;
-;; This package uses the bundled ACP proxy core (`acp.el`) to provide the ACP
-;; layer as per https://agentclientprotocol.com spec.
+;; This package depends on the `acp' package to provide the ACP layer
+;; as per https://agentclientprotocol.com spec.
 ;;
 ;; Report issues at https://github.com/xenodium/agent-shell/issues
 ;;
@@ -1273,6 +1273,7 @@ Flow:
                       (not command))
              (agent-shell-heartbeat-start
               :heartbeat (map-elt agent-shell--state :heartbeat)))
+           ;; Needs ACP subscriptions
            (when-let ((viewport-buffer (agent-shell-viewport--buffer
                                         :shell-buffer shell-buffer
                                         :existing-only t)))
