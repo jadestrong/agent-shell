@@ -39,11 +39,6 @@
 
 ;;; Code:
 
-;; (let ((bundled-acp (expand-file-name "acp.el"
-;;                                      (file-name-directory
-;;                                       (or load-file-name buffer-file-name)))))
-;;   (when (file-exists-p bundled-acp)
-;;     (load bundled-acp nil 'nomessage 'nosuffix)))
 (require 'acp)
 (eval-when-compile
   (require 'cl-lib))
@@ -705,7 +700,6 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :resume-session-id nil)
         (cons :prompt-capabilities nil)
         (cons :event-subscriptions nil)
-        (cons :subscribed nil)
         (cons :active-requests nil)
         (cons :pending-requests nil)
         (cons :usage (list (cons :total-tokens 0)
@@ -1128,10 +1122,10 @@ Flow:
                 :response (agent-shell-viewport--response))))
            (when (agent-shell--initialize-client)
              (agent-shell--handle :command command :shell-buffer shell-buffer)))
-          ;; Needs ACP subscriptions (per-shell state)
-          ((not (map-elt (agent-shell--state) :subscribed))
+          ((or (not (map-nested-elt (agent-shell--state) '(:client :request-handlers)))
+               (not (map-nested-elt (agent-shell--state) '(:client :notification-handlers)))
+               (not (map-nested-elt (agent-shell--state) '(:client :error-handlers))))
            (when (agent-shell--initialize-subscriptions)
-             (map-put! (agent-shell--state) :subscribed t)
              (agent-shell--handle :command command :shell-buffer shell-buffer)))
           ;; Needs to send ACP initialize request
           ((not (map-elt (agent-shell--state) :initialized))
