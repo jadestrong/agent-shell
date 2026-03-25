@@ -596,16 +596,6 @@ variable when both are set."
                  function)
   :group 'agent-shell)
 
-(defcustom agent-shell-debug-session-routing nil
-  "When non-nil, log session routing diagnostics."
-  :type 'boolean
-  :group 'agent-shell)
-
-(defun agent-shell--debug-session-log (fmt &rest args)
-  "Log a session routing debug message when enabled."
-  (when agent-shell-debug-session-routing
-    (apply #'message (concat "[agent-shell] " fmt) args)))
-
 (defun agent-shell--resolve-preferred-config ()
   "Resolve `agent-shell-preferred-agent-config' to a full configuration.
 
@@ -1456,33 +1446,16 @@ COMMAND, when present, may be a shell command string or an argv vector."
   (cond ((equal (map-elt acp-notification 'method) "session/update")
          (let ((notification-session-id (map-nested-elt acp-notification '(params sessionId)))
                (state-session-id (map-nested-elt state '(:session :id))))
-           (agent-shell--debug-session-log
-            "session/update: buffer=%s state-session=%s notif-session=%s update=%s active=%s"
-            (buffer-name (map-elt state :buffer))
-            (or state-session-id "nil")
-            (or notification-session-id "nil")
-            (or (map-nested-elt acp-notification '(params update sessionUpdate)) "nil")
-            (if (agent-shell--active-requests-p state) "t" "nil"))
            ;; Ignore updates from other sessions (e.g. another shell buffer).
            (when (and notification-session-id
                       state-session-id
                       (not (equal notification-session-id state-session-id)))
              (when-let ((target-buffer (agent-shell--buffer-for-session notification-session-id)))
-               (agent-shell--debug-session-log
-                "reroute: from=%s to=%s session=%s"
-                (buffer-name (map-elt state :buffer))
-                (buffer-name target-buffer)
-                notification-session-id)
                (with-current-buffer target-buffer
                  (agent-shell--on-notification
                   :state (buffer-local-value 'agent-shell--state target-buffer)
                   :acp-notification acp-notification))
                (cl-return-from agent-shell--on-notification nil))
-             (agent-shell--debug-session-log
-              "ignored: session mismatch buffer=%s state-session=%s notif-session=%s"
-              (buffer-name (map-elt state :buffer))
-              state-session-id
-              notification-session-id)
              (cl-return-from agent-shell--on-notification nil)))
          (cond
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "tool_call")
@@ -3800,8 +3773,6 @@ DATA is an optional alist of event-specific data."
 
 (cl-defun agent-shell--initialize-subscriptions ()
   "Initialize ACP client subscriptions."
-  (agent-shell--debug-session-log "subscribing: buffer=%s"
-                                  (buffer-name (map-elt agent-shell--state :buffer)))
   (agent-shell--update-fragment
    :state agent-shell--state
    :namespace-id "bootstrapping"
@@ -4239,10 +4210,6 @@ Falls back to latest session in batch mode (e.g. tests)."
 
 (cl-defun agent-shell--set-session-from-response (&key acp-response acp-session-id)
   "Set active session state from ACP-RESPONSE and ACP-SESSION-ID."
-  (agent-shell--debug-session-log
-   "set-session-from-response: buffer=%s sessionId=%s"
-   (buffer-name (map-elt agent-shell--state :buffer))
-   (or acp-session-id "nil"))
   (map-put! agent-shell--state
             :session (list (cons :id acp-session-id)
                            (cons :mode-id (map-nested-elt acp-response '(modes currentModeId)))
@@ -4260,10 +4227,6 @@ Falls back to latest session in batch mode (e.g. tests)."
 
 (cl-defun agent-shell--finalize-session-init (&key on-session-init)
   "Finalize session initialization and invoke ON-SESSION-INIT."
-  (agent-shell--debug-session-log
-   "finalize-session-init: buffer=%s session=%s"
-   (buffer-name (map-elt agent-shell--state :buffer))
-   (or (map-nested-elt agent-shell--state '(:session :id)) "nil"))
   (agent-shell--update-fragment
    :state agent-shell--state
    :block-id "starting"
@@ -4304,10 +4267,6 @@ Falls back to latest session in batch mode (e.g. tests)."
              :mcp-servers (agent-shell--mcp-servers))
    :buffer (current-buffer)
    :on-success (lambda (acp-response)
-                 (agent-shell--debug-session-log
-                  "session/new ok: buffer=%s sessionId=%s"
-                  (buffer-name (map-elt agent-shell--state :buffer))
-                  (or (map-elt acp-response 'sessionId) "nil"))
                  (map-put! agent-shell--state
                            :session (list (cons :id (map-elt acp-response 'sessionId))
                                           (cons :mode-id (map-nested-elt acp-response '(modes currentModeId)))
@@ -4383,10 +4342,6 @@ SESSION-TITLE is an optional display title for the resumed session."
                    :mcp-servers mcp-servers))))
    :buffer (current-buffer)
    :on-success (lambda (acp-load-response)
-                 (agent-shell--debug-session-log
-                  "session/resume ok: buffer=%s sessionId=%s"
-                  (buffer-name (map-elt agent-shell--state :buffer))
-                  (or session-id "nil"))
                  (agent-shell--set-session-from-response
                   :acp-response acp-load-response
                   :acp-session-id session-id)
