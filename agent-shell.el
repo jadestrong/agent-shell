@@ -2516,10 +2516,7 @@ variable (see makunbound)"))
       (when agent-shell-file-completion-enabled
         (agent-shell-completion-mode +1))
       (agent-shell--setup-modeline)
-      (setq-local agent-shell--transcript-file
-                  (unless (and (boundp 'acp-proxy-handles-transcripts)
-                               acp-proxy-handles-transcripts)
-                    (agent-shell--transcript-file-path)))
+      (setq-local agent-shell--transcript-file (agent-shell--transcript-file-path))
       ;; agent-shell does not support restoring sessions from transcript
       ;; via shell-maker. Unalias this functionality so it's not
       ;; misleading to users or appear via M-x.
