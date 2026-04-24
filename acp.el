@@ -210,6 +210,8 @@ Other arguments match acp.el semantics."
         (cons :agent-name agent-name)
         (cons :proxy-connected nil)
         (cons :connect-result nil)
+        (cons :connect-state 'disconnected)
+        (cons :connect-waiters ())
         (cons :pending-permission-requests (make-hash-table :test 'equal))))
 
 (defun acp--client-started-p (client)
@@ -228,7 +230,7 @@ Other arguments match acp.el semantics."
   (let (out)
     (dolist (entry env-list (nreverse out))
       (when (string-match "\\`\\([^=]+\\)=\\(.*\\)\\'" entry)
-        (push (cons (match-string 1 entry) (match-string 2 entry)) out)))))
+        (push (cons (intern (match-string 1 entry)) (match-string 2 entry)) out)))))
 
 (defun acp--agent-spec (client)
   "Return an agent spec plist for CLIENT."
@@ -257,8 +259,8 @@ Other arguments match acp.el semantics."
     (acp--normalize-object
      (jsonrpc-request (map-elt client :connection) (intern method) params))))
 
-(defun acp--connect-agent (client)
-  "Connect the agent for CLIENT via the proxy."
+(defun acp--connect-agent-params (client)
+  "Build connect params for CLIENT."
   (let* ((agent-name (or (map-elt client :agent-name)
                          (error ":agent-name is required")))
          (command (map-elt client :command))
@@ -269,19 +271,95 @@ Other arguments match acp.el semantics."
                            (append (list :command command
                                          :args (if args (vconcat args) []))
                                    (when (and env (not (null env)))
-                                     (list :env env))))))
-         (result (acp--jsonrpc-request
-                  client
-                  "acp/connectAgent"
-                  params)))
+                                     (list :env env)))))))
+    params))
+
+(defun acp--finish-connect (client result)
+  "Mark CLIENT as connected with RESULT."
   (map-put! client :proxy-connected t)
   (map-put! client :connect-result result)
-  result))
+  (map-put! client :connect-state 'connected))
 
-(defun acp--ensure-connected (client)
-  "Ensure CLIENT is connected to its agent."
-  (unless (map-elt client :proxy-connected)
-    (acp--connect-agent client)))
+(defun acp--fail-connect (client)
+  "Mark CLIENT as disconnected after connect failure."
+  (map-put! client :proxy-connected nil)
+  (map-put! client :connect-state 'failed))
+
+(cl-defun acp--drain-connect-waiters (client &key result error)
+  "Drain and run connect waiters for CLIENT."
+  (let ((waiters (reverse (map-elt client :connect-waiters))))
+    (map-put! client :connect-waiters ())
+    (dolist (waiter waiters)
+      (let ((on-success (map-elt waiter :on-success))
+            (on-failure (map-elt waiter :on-failure)))
+        (if error
+            (when on-failure
+              (funcall on-failure error))
+          (when on-success
+            (funcall on-success result)))))))
+
+(defun acp--connect-agent-sync (client)
+  "Synchronously connect CLIENT to its agent."
+  (let ((result (acp--jsonrpc-request
+                 client
+                 "acp/connectAgent"
+                 (acp--connect-agent-params client))))
+    (acp--finish-connect client result)
+    result))
+
+(cl-defun acp--connect-agent-async (&key client on-success on-failure)
+  "Asynchronously connect CLIENT to its agent."
+  (acp--jsonrpc-request
+   client
+   "acp/connectAgent"
+   (acp--connect-agent-params client)
+   (lambda (result)
+     (acp--finish-connect client result)
+     (acp--drain-connect-waiters client :result result)
+     (when on-success
+       (funcall on-success result)))
+   (lambda (err)
+     (acp--fail-connect client)
+     (acp--drain-connect-waiters client :error err)
+     (when on-failure
+       (funcall on-failure err)))))
+
+(cl-defun acp--ensure-connected (&key client on-success on-failure sync)
+  "Ensure CLIENT is connected.
+
+When SYNC is non-nil, connect synchronously and return the connect result.
+When SYNC is nil, invoke ON-SUCCESS/ON-FAILURE asynchronously."
+  (let ((state (or (map-elt client :connect-state)
+                   (if (map-elt client :proxy-connected)
+                       'connected
+                     'disconnected))))
+    (cond
+     (sync
+      (if (eq state 'connected)
+          (map-elt client :connect-result)
+        (condition-case err
+            (acp--connect-agent-sync client)
+          (error
+           (acp--fail-connect client)
+           (let ((err-obj `((code . -32603) (message . ,(error-message-string err)))))
+             (when on-failure
+               (funcall on-failure err-obj))
+             (error "ACP connect failed: %s" err-obj))))))
+     ((eq state 'connected)
+      (when on-success
+        (run-at-time 0 nil on-success (map-elt client :connect-result))))
+     ((eq state 'connecting)
+      (map-put! client :connect-waiters
+                (cons (list (cons :on-success on-success)
+                            (cons :on-failure on-failure))
+                      (map-elt client :connect-waiters))))
+     (t
+      (map-put! client :connect-state 'connecting)
+      (map-put! client :connect-waiters
+                (cons (list (cons :on-success on-success)
+                            (cons :on-failure on-failure))
+                      (map-elt client :connect-waiters)))
+      (acp--connect-agent-async :client client)))))
 
 (cl-defun acp--start-client (&key client)
   "Start CLIENT." 
@@ -362,6 +440,8 @@ Other arguments match acp.el semantics."
     (setq acp--shared-clients 0)
     (setq acp--shared-client-list nil)
     (map-put! client :proxy-connected nil)
+    (map-put! client :connect-state 'disconnected)
+    (map-put! client :connect-waiters ())
     (map-put! client :connection nil)
     (map-put! client :process nil)))
 
@@ -376,6 +456,8 @@ Other arguments match acp.el semantics."
                acp--shared-connection)
       (jsonrpc-shutdown acp--shared-connection))
     (map-put! client :proxy-connected nil)
+    (map-put! client :connect-state 'disconnected)
+    (map-put! client :connect-waiters ())
     (map-put! client :connection nil)
     (map-put! client :process nil))
   (when (buffer-live-p (acp-logs-buffer :client client))
@@ -594,47 +676,58 @@ When non-nil SYNC, send notification synchronously."
                 (funcall on-failure err)))
           (error "ACP request failed: %s" err)))
       (cl-return-from acp--request-sender nil))
-    (when (string= proxy-method "acp/connectAgent")
-      (acp--ensure-connected client)
-      (let ((result (map-elt client :connect-result)))
-        (if sync
-            (cl-return-from acp--request-sender (if result-mapper (funcall result-mapper result) result))
-          (when on-success
-            (with-temp-buffer
-              (with-current-buffer (or buffer (map-elt client :context-buffer) (current-buffer))
-                (funcall on-success (if result-mapper (funcall result-mapper result) result)))))
-          (cl-return-from acp--request-sender nil))))
-    (acp--ensure-connected client)
     (let ((timeout (if (string= proxy-method "acp/prompt")
                        acp-prompt-timeout
                      :default)))
       (if sync
-          (condition-case err
-              (let* ((result (acp--jsonrpc-request client proxy-method proxy-params nil nil timeout))
-                     (mapped (if result-mapper (funcall result-mapper result) result)))
-                mapped)
-            (error
-             (let ((err-obj `((code . -32603) (message . ,(error-message-string err)))))
-               (if on-failure
-                   (with-temp-buffer
-                     (with-current-buffer (or buffer (map-elt client :context-buffer) (current-buffer))
-                       (funcall on-failure err-obj)))
-                 (error "ACP request failed: %s" err-obj)))))
-        (acp--jsonrpc-request
-         client
-         proxy-method
-         proxy-params
-         (when on-success
-           (lambda (result)
-             (with-temp-buffer
-               (with-current-buffer (or buffer (map-elt client :context-buffer) (current-buffer))
-                 (funcall on-success (if result-mapper (funcall result-mapper result) result))))))
-         (when on-failure
-           (lambda (err)
-             (with-temp-buffer
-               (with-current-buffer (or buffer (map-elt client :context-buffer) (current-buffer))
-                 (funcall on-failure err)))))
-         timeout)))))
+          (progn
+            (acp--ensure-connected :client client :on-failure on-failure :sync t)
+            (condition-case err
+                (let* ((result (if (string= proxy-method "acp/connectAgent")
+                                   (map-elt client :connect-result)
+                                 (acp--jsonrpc-request client proxy-method proxy-params nil nil timeout)))
+                       (mapped (if result-mapper (funcall result-mapper result) result)))
+                  mapped)
+              (error
+               (let ((err-obj `((code . -32603) (message . ,(error-message-string err)))))
+                 (if on-failure
+                     (with-temp-buffer
+                       (with-current-buffer (or buffer (map-elt client :context-buffer) (current-buffer))
+                         (funcall on-failure err-obj)))
+                   (error "ACP request failed: %s" err-obj))))))
+        (acp--ensure-connected
+         :client client
+         :on-success (lambda (_connect-result)
+                       (if (string= proxy-method "acp/connectAgent")
+                           (when on-success
+                             (with-temp-buffer
+                               (with-current-buffer (or buffer (map-elt client :context-buffer) (current-buffer))
+                                 (funcall on-success
+                                          (if result-mapper
+                                              (funcall result-mapper (map-elt client :connect-result))
+                                            (map-elt client :connect-result))))))
+                         (acp--jsonrpc-request
+                          client
+                          proxy-method
+                          proxy-params
+                          (when on-success
+                            (lambda (result)
+                              (with-temp-buffer
+                                (with-current-buffer (or buffer (map-elt client :context-buffer) (current-buffer))
+                                  (funcall on-success
+                                           (if result-mapper (funcall result-mapper result) result))))))
+                          (when on-failure
+                            (lambda (err)
+                              (with-temp-buffer
+                                (with-current-buffer (or buffer (map-elt client :context-buffer) (current-buffer))
+                                  (funcall on-failure err)))))
+                          timeout)))
+         :on-failure (when on-failure
+                       (lambda (err)
+                         (with-temp-buffer
+                           (with-current-buffer (or buffer (map-elt client :context-buffer) (current-buffer))
+                             (funcall on-failure err)))))
+         :sync nil)))))
 
 (cl-defun acp--notification-sender (&key client notification sync)
   "Send NOTIFICATION from CLIENT via proxy." 
@@ -642,16 +735,20 @@ When non-nil SYNC, send notification synchronously."
          (params (map-elt notification :params)))
     (pcase method
       ("session/cancel"
-       (if sync
-           (acp--jsonrpc-request
-            client "acp/cancel"
-            (list :sessionId (acp--get params 'sessionId)
-                  :reason (acp--get params 'reason)))
-         (acp--jsonrpc-request
-          client "acp/cancel"
-          (list :sessionId (acp--get params 'sessionId)
-                :reason (acp--get params 'reason))
-          #'ignore #'ignore)))
+       (let ((cancel-params (list :sessionId (acp--get params 'sessionId)
+                                  :reason (acp--get params 'reason))))
+         (if sync
+             (progn
+               (acp--ensure-connected :client client :sync t)
+               (acp--jsonrpc-request client "acp/cancel" cancel-params))
+           (acp--ensure-connected
+            :client client
+            :on-success (lambda (_connect-result)
+                          (acp--jsonrpc-request
+                           client "acp/cancel" cancel-params
+                           #'ignore #'ignore))
+            :on-failure #'ignore
+            :sync nil))))
       (_
        (acp--log client "NOTIFICATION" "Unsupported notification: %s" method)))))
 
