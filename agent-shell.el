@@ -1749,6 +1749,39 @@ COMMAND, when present, may be a shell command string or an argv vector."
             :create-new t
             :navigation 'never)
            (map-put! state :last-entry-type nil))))
+        ((equal (map-elt acp-notification 'method) "agent/ext-notification")
+         (let* ((orig-method (map-nested-elt acp-notification '(params method)))
+                (orig-params (map-nested-elt acp-notification '(params params))))
+           (cond
+            ((and orig-method
+                  (string-match-p "rate.limit\\|error/rate" orig-method))
+             (agent-shell--update-fragment
+              :state state
+              :block-id (format "%s-rate-limit" (map-elt state :request-count))
+              :body (or (map-elt orig-params 'message)
+                        "Rate limit exceeded. Please wait a moment before trying again.")
+              :create-new t)
+             (map-put! state :last-entry-type nil))
+            (acp-logging-enabled
+             (message "Agent ext notification: %s" orig-method)))))
+        ((equal (map-elt acp-notification 'method) "agent/disconnected")
+         (agent-shell-heartbeat-stop :heartbeat (map-elt state :heartbeat))
+         (let ((exit-code (map-nested-elt acp-notification '(params exitCode)))
+               (agent-name (map-nested-elt acp-notification '(params agentName))))
+           (agent-shell--update-fragment
+            :state state
+            :block-id (format "agent-disconnected-%s" (map-elt state :request-count))
+            :body (agent-shell--make-error-dialog-text
+                   :code exit-code
+                   :message (format "Agent '%s' disconnected (exit code: %s)"
+                                    (or agent-name "?")
+                                    (or exit-code "unknown")))
+            :create-new t)
+           (agent-shell--emit-event :event 'error
+                                    :data (list (cons :code exit-code)
+                                                (cons :message (format "Agent '%s' disconnected"
+                                                                       (or agent-name "?")))))
+           (shell-maker-finish-output :config shell-maker--config :success nil)))
         (acp-logging-enabled
          (agent-shell--update-fragment
           :state state
@@ -3795,7 +3828,7 @@ through to `acp-send-request'."
                                        (map-elt state :active-requests)))
                  (when on-success
                    (funcall on-success acp-response)))
-   :on-failure (lambda (acp-error raw-message)
+   :on-failure (lambda (acp-error &optional raw-message)
                  (map-put! state :active-requests
                            (seq-remove (lambda (r)
                                          (equal r request))
@@ -4794,7 +4827,7 @@ If FILE-PATH is not an image, returns nil."
                          (agent-shell-viewport--update-header)))
                      (when success
                        (agent-shell--process-pending-request))))
-     :on-failure (lambda (acp-error raw-message)
+     :on-failure (lambda (acp-error &optional raw-message)
                    ;; Display pending requests on failure.
                    (agent-shell--display-pending-requests)
                    (funcall (agent-shell--make-error-handler :state agent-shell--state :shell-buffer shell-buffer)

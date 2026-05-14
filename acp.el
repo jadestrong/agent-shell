@@ -888,6 +888,8 @@ When non-nil SYNC, send notification synchronously."
      (acp--dispatch-notification client "agent/disconnected" (acp--normalize-object params)))
     ("acp/fileChanged"
      (acp--dispatch-notification client "fs/file_changed" (acp--normalize-object params)))
+    ("acp/agentExtNotification"
+     (acp--dispatch-notification client "agent/ext-notification" (acp--normalize-object params)))
     (_
      (acp--dispatch-notification client
                                  (acp--normalize-method method)

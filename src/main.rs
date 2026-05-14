@@ -2,7 +2,6 @@ pub mod agent;
 pub mod application;
 pub mod config;
 pub mod connection;
-pub mod delegate;
 pub mod main_loop;
 pub mod msg;
 

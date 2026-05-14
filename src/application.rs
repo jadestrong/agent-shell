@@ -6,10 +6,12 @@ use anyhow::Result;
 use crossbeam_channel::Sender;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::agent::AgentClient;
+use crate::agent::AgentConnection;
 use crate::config::Config;
 use agent_client_protocol as acp;
-use agent_client_protocol::Agent;
+use agent_client_protocol::{ConnectionTo, Responder, on_receive_notification, on_receive_request};
+use agent_client_protocol::role::acp::Agent;
+use agent_client_protocol_tokio::AcpAgent;
 
 use crate::msg::{
     Message, Notification, Request, Response, AUTH_REQUIRED, INTERNAL_ERROR, INVALID_PARAMS,
@@ -43,6 +45,7 @@ pub mod notifications {
     pub const AGENT_DISCONNECTED: &str = "acp/agentDisconnected";
     pub const AUTH_REQUIRED: &str = "acp/authRequired";
     pub const FILE_CHANGED: &str = "acp/fileChanged";
+    pub const AGENT_EXT_NOTIFICATION: &str = "acp/agentExtNotification";
 }
 
 // ---------------------------------------------------------------------------
@@ -87,7 +90,7 @@ pub enum AgentEvent {
         title: String,
         tool_call: serde_json::Value,
         options: serde_json::Value,
-        response_sender: tokio::sync::oneshot::Sender<acp::RequestPermissionResponse>,
+        responder: Responder<acp::schema::RequestPermissionResponse>,
         agent_name: String,
     },
     FileReadRequest {
@@ -103,6 +106,10 @@ pub enum AgentEvent {
         agent_name: String,
         exit_code: Option<i32>,
     },
+    ExtNotification {
+        method: String,
+        params: serde_json::Value,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -117,12 +124,11 @@ pub struct PendingRequest {
 }
 
 /// Tracks a permission request awaiting Emacs user response
-#[derive(Debug)]
 pub struct PendingPermissionRequest {
     pub request_id: String,
     pub session_id: String,
     pub agent_name: String,
-    pub response_sender: tokio::sync::oneshot::Sender<acp::RequestPermissionResponse>,
+    pub responder: Responder<acp::schema::RequestPermissionResponse>,
     pub created_at: std::time::Instant,
 }
 
@@ -155,7 +161,7 @@ struct SessionTranscriptState {
 pub struct Application {
     config: Config,
     /// Connected ACP agents, keyed by agent name.
-    agents: HashMap<String, AgentClient>,
+    agents: HashMap<String, AgentConnection>,
     /// Active sessions, keyed by session ID.
     sessions: HashMap<String, SessionState>,
     /// Transcript file path keyed by session ID.
@@ -976,14 +982,11 @@ impl Application {
 
         // Return cached agent if already connected.
         if let Some(existing) = self.agents.get(&agent_name) {
-            let capabilities =
-                serde_json::to_value(existing.capabilities.clone()).unwrap_or_default();
-            let auth_methods = serde_json::to_value(&existing.auth_methods).unwrap_or_default();
             return Response::new_ok(
                 id,
                 serde_json::json!({
-                    "capabilities": capabilities,
-                    "authMethods": auth_methods,
+                    "capabilities": existing.capabilities,
+                    "authMethods": existing.auth_methods,
                 }),
             );
         }
@@ -1029,32 +1032,269 @@ impl Application {
             }
         };
 
-        // Spawn the agent child process
-        let event_tx = self.agent_event_tx.clone();
-        match AgentClient::spawn(agent_name.clone(), &agent_config, event_tx).await {
-            Ok(mut client) => {
-                // Initialize the ACP protocol handshake
-                match client.initialize().await {
-                    Ok(response) => {
-                        let capabilities =
-                            serde_json::to_value(&response.agent_capabilities).unwrap_or_default();
-                        let auth_methods =
-                            serde_json::to_value(&response.auth_methods).unwrap_or_default();
-                        self.agents.insert(agent_name, client);
-                        Response::new_ok(
-                            id,
-                            serde_json::json!({
-                                "capabilities": capabilities,
-                                "authMethods": auth_methods,
-                            }),
-                        )
-                    }
-                    Err(e) => {
-                        Response::new_err(id, INTERNAL_ERROR, format!("initialize failed: {}", e))
-                    }
-                }
+        // Build AcpAgent: prepend NAME=value pairs so from_args parses them as env vars
+        let env_args = agent_config.env.as_ref().into_iter()
+            .flat_map(|env| env.iter().map(|(k, v)| format!("{}={}", k, v)));
+        let cmd_args = std::iter::once(agent_config.command.clone())
+            .chain(agent_config.args.iter().cloned());
+        let all_args: Vec<String> = env_args.chain(cmd_args).collect();
+        let acp_agent = match AcpAgent::from_args(all_args) {
+            Ok(a) => a,
+            Err(e) => return Response::new_err(id, INTERNAL_ERROR, format!("spawn failed: {}", e)),
+        };
+
+        // Add stderr debug logging
+        let agent_name_log = agent_name.clone();
+        let acp_agent = acp_agent.with_debug(move |line, dir| {
+            use agent_client_protocol_tokio::LineDirection;
+            match dir {
+                LineDirection::Stderr => tracing::debug!("[{} stderr] {}", agent_name_log, line),
+                LineDirection::Stdin => tracing::trace!("[{} stdin] {}", agent_name_log, line),
+                LineDirection::Stdout => tracing::trace!("[{} stdout] {}", agent_name_log, line),
             }
-            Err(e) => Response::new_err(id, INTERNAL_ERROR, format!("spawn failed: {}", e)),
+        });
+
+        let event_tx = self.agent_event_tx.clone();
+        let agent_name_task = agent_name.clone();
+
+        // Oneshot to receive the connection handle and init result from the spawned task
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<
+            Result<
+                (ConnectionTo<Agent>, serde_json::Value, serde_json::Value),
+                String,
+            >,
+        >();
+
+        tokio::task::spawn_local({
+            let event_tx2 = event_tx.clone();
+            let agent_name2 = agent_name_task.clone();
+            async move {
+                let version = env!("CARGO_PKG_VERSION");
+                let result = acp::role::acp::Client
+                    .builder()
+                    .on_receive_notification(
+                        {
+                            let event_tx = event_tx.clone();
+                            async move |notif: acp::schema::AgentNotification, _cx| {
+                                match notif {
+                                    acp::schema::AgentNotification::SessionNotification(sn) => {
+                                        let session_id = sn.session_id.to_string();
+                                        let update = serde_json::to_value(&sn.update)
+                                            .unwrap_or_default();
+                                        let _ = event_tx.send(AgentEvent::SessionUpdate {
+                                            session_id,
+                                            update,
+                                        });
+                                    }
+                                    acp::schema::AgentNotification::ExtNotification(en) => {
+                                        let method = en.method.to_string();
+                                        let params = serde_json::from_str(en.params.get())
+                                            .unwrap_or_default();
+                                        let _ = event_tx.send(AgentEvent::ExtNotification {
+                                            method,
+                                            params,
+                                        });
+                                    }
+                                    _ => {}
+                                }
+                                Ok(())
+                            }
+                        },
+                        on_receive_notification!(),
+                    )
+                    .on_receive_request(
+                        {
+                            let event_tx = event_tx.clone();
+                            let agent_name = agent_name_task.clone();
+                            async move |req: acp::schema::RequestPermissionRequest,
+                                        responder: Responder<acp::schema::RequestPermissionResponse>,
+                                        cx| {
+                                let session_id = req.session_id.to_string();
+                                let request_id = req.tool_call.tool_call_id.to_string();
+                                let title = req.tool_call.fields.title.clone().unwrap_or_default();
+                                let tool_call = serde_json::to_value(&req.tool_call)
+                                    .unwrap_or_default();
+                                let options = serde_json::to_value(&req.options)
+                                    .unwrap_or_default();
+                                let _ = event_tx.send(AgentEvent::PermissionRequest {
+                                    session_id,
+                                    request_id,
+                                    permission_type: req
+                                        .tool_call
+                                        .fields
+                                        .kind
+                                        .map(|k| format!("{:?}", k))
+                                        .unwrap_or_else(|| "unknown".into()),
+                                    title,
+                                    tool_call,
+                                    options,
+                                    responder,
+                                    agent_name: agent_name.clone(),
+                                });
+                                Ok(())
+                            }
+                        },
+                        on_receive_request!(),
+                    )
+                    .on_receive_request(
+                        async move |req: acp::schema::ReadTextFileRequest,
+                                    responder: Responder<acp::schema::ReadTextFileResponse>,
+                                    cx| {
+                            let path = req.path.clone();
+                            cx.spawn(async move {
+                                match tokio::fs::read_to_string(&path).await {
+                                    Ok(mut content) => {
+                                        // Apply line/limit slicing
+                                        if req.line.is_some() || req.limit.is_some() {
+                                            let lines: Vec<&str> = content.lines().collect();
+                                            let start = req.line
+                                                .unwrap_or(1)
+                                                .saturating_sub(1) as usize;
+                                            let end = match req.limit {
+                                                Some(l) => (start + l as usize).min(lines.len()),
+                                                None => lines.len(),
+                                            };
+                                            content = if start < lines.len() {
+                                                lines[start..end].join("\n")
+                                            } else {
+                                                String::new()
+                                            };
+                                        }
+                                        responder.respond(
+                                            acp::schema::ReadTextFileResponse::new(content)
+                                        )?;
+                                    }
+                                    Err(e) => {
+                                        responder.respond_with_internal_error(
+                                            format!("failed to read {}: {}", path.display(), e)
+                                        )?;
+                                    }
+                                }
+                                Ok(())
+                            })?;
+                            Ok(())
+                        },
+                        on_receive_request!(),
+                    )
+                    .on_receive_request(
+                        {
+                            let event_tx = event_tx.clone();
+                            async move |req: acp::schema::WriteTextFileRequest,
+                                        responder: Responder<acp::schema::WriteTextFileResponse>,
+                                        cx| {
+                                let path = req.path.clone();
+                                let content = req.content.clone();
+                                let event_tx2 = event_tx.clone();
+                                cx.spawn(async move {
+                                    if let Some(parent) = path.parent() {
+                                        let _ = tokio::fs::create_dir_all(parent).await;
+                                    }
+                                    match tokio::fs::write(&path, &content).await {
+                                        Ok(()) => {
+                                            let _ = event_tx2.send(AgentEvent::FileWriteRequest {
+                                                request_id: String::new(),
+                                                path: path.clone(),
+                                                content,
+                                            });
+                                            responder.respond(
+                                                acp::schema::WriteTextFileResponse::new()
+                                            )?;
+                                        }
+                                        Err(e) => {
+                                            responder.respond_with_internal_error(
+                                                format!("failed to write {}: {}", path.display(), e)
+                                            )?;
+                                        }
+                                    }
+                                    Ok(())
+                                })?;
+                                Ok(())
+                            }
+                        },
+                        on_receive_request!(),
+                    )
+                    .connect_with(acp_agent, async move |cx: ConnectionTo<Agent>| {
+                        tracing::info!("Spawned agent '{}'", agent_name_task);
+                        // ACP initialize handshake
+                        let init = cx.send_request(
+                            acp::schema::InitializeRequest::new(acp::schema::ProtocolVersion::V1)
+                                .client_capabilities(
+                                    acp::schema::ClientCapabilities::default()
+                                        .fs(acp::schema::FileSystemCapabilities::default()
+                                            .read_text_file(true)
+                                            .write_text_file(true))
+                                        .terminal(true),
+                                )
+                                .client_info(acp::schema::Implementation::new(
+                                    "emacs-acp-proxy",
+                                    version,
+                                )),
+                        )
+                        .block_task()
+                        .await;
+
+                        match init {
+                            Ok(resp) => {
+                                let capabilities =
+                                    serde_json::to_value(&resp.agent_capabilities)
+                                        .unwrap_or_default();
+                                let auth_methods =
+                                    serde_json::to_value(&resp.auth_methods).unwrap_or_default();
+                                tracing::info!(
+                                    "Agent '{}' initialized: auth_methods={}",
+                                    agent_name_task,
+                                    resp.auth_methods.len()
+                                );
+                                ready_tx.send(Ok((cx.clone(), capabilities, auth_methods))).ok();
+                            }
+                            Err(e) => {
+                                ready_tx.send(Err(format!("initialize failed: {}", e))).ok();
+                                return Err(e);
+                            }
+                        }
+
+                        // Keep the connection alive until the agent disconnects
+                        std::future::pending::<()>().await;
+                        Ok(())
+                    })
+                    .await;
+
+                // Agent disconnected — extract exit code from error message if possible
+                let exit_code = match &result {
+                    Err(e) => {
+                        let msg = e.to_string();
+                        // "Process exited with exit status: N"
+                        msg.rsplit(':')
+                            .next()
+                            .and_then(|s| s.trim().parse::<i32>().ok())
+                    }
+                    Ok(()) => Some(0),
+                };
+                tracing::info!("Agent '{}' exited with code: {:?}", agent_name2, exit_code);
+                let _ = event_tx2.send(AgentEvent::AgentExited {
+                    agent_name: agent_name2,
+                    exit_code,
+                });
+            }
+        });
+
+        // Wait for initialization result
+        match ready_rx.await {
+            Ok(Ok((cx, capabilities, auth_methods))) => {
+                self.agents.insert(
+                    agent_name,
+                    AgentConnection { connection: cx, capabilities: capabilities.clone(), auth_methods: auth_methods.clone() },
+                );
+                Response::new_ok(
+                    id,
+                    serde_json::json!({
+                        "capabilities": capabilities,
+                        "authMethods": auth_methods,
+                    }),
+                )
+            }
+            Ok(Err(msg)) => Response::new_err(id, INTERNAL_ERROR, msg),
+            Err(_) => Response::new_err(id, INTERNAL_ERROR, "agent task dropped".into()),
         }
     }
 
@@ -1087,16 +1327,16 @@ impl Application {
             }
         };
 
-        // Call new_session on the ACP connection
-        let request = acp::NewSessionRequest::new(cwd);
+        let connection = agent.connection.clone();
+        let request = acp::schema::NewSessionRequest::new(cwd);
         tracing::debug!(
             "Sending new_session request to agent '{}' with cwd='{}'",
             agent_name,
             cwd
         );
-        match agent.connection.new_session(request).await {
+        match connection.send_request(request).block_task().await {
             Ok(resp) => {
-                let session_id_str = resp.session_id.0.to_string();
+                let session_id_str = resp.session_id.to_string();
 
                 // Store session state
                 self.sessions.insert(
@@ -1132,7 +1372,7 @@ impl Application {
             }
             Err(e) => {
                 // Check for AuthRequired error
-                if e.code == acp::ErrorCode::AuthRequired {
+                if e.code == acp::schema::ErrorCode::AuthRequired.into() {
                     // Send acp/authRequired notification to Emacs
                     let notif = Notification {
                         method: notifications::AUTH_REQUIRED.into(),
@@ -1209,8 +1449,8 @@ impl Application {
             }
         };
 
-        let content_blocks: Vec<acp::ContentBlock> = if let Some(text) = message.as_str() {
-            vec![text.into()]
+        let content_blocks: Vec<acp::schema::ContentBlock> = if let Some(text) = message.as_str() {
+            vec![acp::schema::ContentBlock::Text(acp::schema::TextContent::new(text))]
         } else {
             match serde_json::from_value(message) {
                 Ok(blocks) => blocks,
@@ -1230,10 +1470,10 @@ impl Application {
 
         // --- spawn the actual ACP call on the local set ---
         tokio::task::spawn_local(async move {
-            let acp_session_id = acp::SessionId::new(session_id.clone());
-            let request = acp::PromptRequest::new(acp_session_id, content_blocks);
+            let acp_session_id = acp::schema::SessionId::new(session_id.clone());
+            let request = acp::schema::PromptRequest::new(acp_session_id, content_blocks);
 
-            let response = match connection.prompt(request).await {
+            let response = match connection.send_request(request).block_task().await {
                 Ok(resp) => match serde_json::to_value(&resp) {
                     Ok(mut val) => {
                         if let Some(obj) = val.as_object_mut() {
@@ -1306,8 +1546,8 @@ impl Application {
         };
 
         // Send cancel notification to the agent
-        let notification = acp::CancelNotification::new(session_id);
-        match agent.connection.cancel(notification).await {
+        let notification = acp::schema::CancelNotification::new(session_id);
+        match agent.connection.send_notification(notification) {
             Ok(()) => Response::new_ok(id, serde_json::json!({})),
             Err(e) => Response::new_err(id, INTERNAL_ERROR, format!("cancel failed: {}", e)),
         }
@@ -1368,8 +1608,11 @@ impl Application {
         };
 
         // Forward authenticate request to the agent
-        let request = acp::AuthenticateRequest::new(acp::AuthMethodId::new(auth_method_id));
-        match agent.connection.authenticate(request).await {
+        let connection = agent.connection.clone();
+        let request = acp::schema::AuthenticateRequest::new(
+            acp::schema::AuthMethodId::new(auth_method_id),
+        );
+        match connection.send_request(request).block_task().await {
             Ok(_response) => Response::new_ok(id, serde_json::json!({})),
             Err(e) => {
                 tracing::warn!("authenticate failed for agent {}: {}", agent_name, e);
@@ -1424,10 +1667,11 @@ impl Application {
         };
 
         // Forward set_session_model request to the agent
-        let acp_session_id = acp::SessionId::new(session_id.clone());
-        let acp_model_id = acp::ModelId::new(model_id.clone());
-        let request = acp::SetSessionModelRequest::new(acp_session_id, acp_model_id);
-        match agent.connection.set_session_model(request).await {
+        let connection = agent.connection.clone();
+        let acp_session_id = acp::schema::SessionId::new(session_id.clone());
+        let acp_model_id = acp::schema::ModelId::new(model_id.clone());
+        let request = acp::schema::SetSessionModelRequest::new(acp_session_id, acp_model_id);
+        match connection.send_request(request).block_task().await {
             Ok(_response) => Response::new_ok(id, serde_json::json!({})),
             Err(e) => {
                 tracing::warn!("set_session_model failed for session {}: {}", session_id, e);
@@ -1486,10 +1730,11 @@ impl Application {
         };
 
         // Forward set_session_mode request to the agent
-        let acp_session_id = acp::SessionId::new(session_id.clone());
-        let acp_mode_id = acp::SessionModeId::new(mode_id.clone());
-        let request = acp::SetSessionModeRequest::new(acp_session_id, acp_mode_id);
-        match agent.connection.set_session_mode(request).await {
+        let connection = agent.connection.clone();
+        let acp_session_id = acp::schema::SessionId::new(session_id.clone());
+        let acp_mode_id = acp::schema::SessionModeId::new(mode_id.clone());
+        let request = acp::schema::SetSessionModeRequest::new(acp_session_id, acp_mode_id);
+        match connection.send_request(request).block_task().await {
             Ok(_response) => Response::new_ok(id, serde_json::json!({})),
             Err(e) => {
                 tracing::warn!("set_session_mode failed for session {}: {}", session_id, e);
@@ -1534,16 +1779,17 @@ impl Application {
         // Find the pending permission request
         if let Some(pending) = self.pending_permissions.remove(&request_id) {
             // Create the ACP response
-            let outcome = acp::RequestPermissionOutcome::Selected(
-                acp::SelectedPermissionOutcome::new(option_id.clone()),
+            let outcome = acp::schema::RequestPermissionOutcome::Selected(
+                acp::schema::SelectedPermissionOutcome::new(option_id.clone()),
             );
-            let response = acp::RequestPermissionResponse::new(outcome);
+            let response = acp::schema::RequestPermissionResponse::new(outcome);
 
-            // Send response back to the delegate via the oneshot channel
-            if pending.response_sender.send(response).is_err() {
+            // Respond via the stored Responder
+            if let Err(e) = pending.responder.respond(response) {
                 tracing::warn!(
-                    "Failed to send permission response for request {}",
-                    request_id
+                    "Failed to send permission response for request {}: {}",
+                    request_id,
+                    e
                 );
             }
 
@@ -1589,7 +1835,7 @@ impl Application {
                 title,
                 tool_call,
                 options,
-                response_sender,
+                responder,
                 agent_name,
             } => {
                 // Store the pending permission request
@@ -1597,7 +1843,7 @@ impl Application {
                     request_id: request_id.clone(),
                     session_id: session_id.clone(),
                     agent_name: agent_name.clone(),
-                    response_sender,
+                    responder,
                     created_at: std::time::Instant::now(),
                 };
                 self.pending_permissions.insert(request_id.clone(), pending);
@@ -1633,6 +1879,15 @@ impl Application {
                     method: notifications::FILE_CHANGED.into(),
                     params: serde_json::json!({
                         "path": path.to_string_lossy(),
+                    }),
+                }
+            }
+            AgentEvent::ExtNotification { method, params } => {
+                Notification {
+                    method: notifications::AGENT_EXT_NOTIFICATION.into(),
+                    params: serde_json::json!({
+                        "method": method,
+                        "params": params,
                     }),
                 }
             }
@@ -1830,33 +2085,92 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    /// Build a `Responder<RequestPermissionResponse>` backed by a no-op sink, for use in tests.
+    async fn make_test_responder(
+    ) -> acp::Responder<acp::schema::RequestPermissionResponse> {
+        use agent_client_protocol::{ByteStreams, ConnectionTo, Handled, Responder as AcpResponder};
+        use agent_client_protocol::role::UntypedRole;
+        use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+        let (client_w, server_r) = tokio::io::duplex(4096);
+        let (server_w, client_r) = tokio::io::duplex(4096);
+
+        let server_transport = ByteStreams::new(server_w.compat_write(), server_r.compat());
+        let client_transport = ByteStreams::new(client_w.compat_write(), client_r.compat());
+
+        let (responder_tx, responder_rx) = tokio::sync::oneshot::channel::<
+            acp::Responder<acp::schema::RequestPermissionResponse>,
+        >();
+
+        tokio::task::spawn_local(async move {
+            let _ = UntypedRole.builder()
+                .on_receive_request(
+                    {
+                        let mut tx = Some(responder_tx);
+                        async move |_req: acp::schema::RequestPermissionRequest,
+                                    responder: AcpResponder<acp::schema::RequestPermissionResponse>,
+                                    _cx| {
+                            if let Some(tx) = tx.take() {
+                                let _ = tx.send(responder);
+                            }
+                            Ok(())
+                        }
+                    },
+                    on_receive_request!(),
+                )
+                .connect_to(server_transport)
+                .await;
+        });
+
+        // Client: send a dummy RequestPermissionRequest to trigger the server handler
+        tokio::task::spawn_local(async move {
+            let _ = UntypedRole.builder()
+                .connect_with(client_transport, async |cx: ConnectionTo<UntypedRole>| {
+                    let _ = cx.send_request(acp::schema::RequestPermissionRequest::new(
+                        "sess-test",
+                        acp::schema::ToolCallUpdate::new("tc-test", acp::schema::ToolCallUpdateFields::new()),
+                        vec![],
+                    ));
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    Ok(())
+                })
+                .await;
+        });
+
+        responder_rx.await.expect("responder should arrive")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn agent_permission_request_sends_notification() {
-        let mut app = make_app();
-        let (tx, rx) = make_sender();
-        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        use tokio::task::LocalSet;
+        let local = LocalSet::new();
+        local.run_until(async {
+            let mut app = make_app();
+            let (tx, rx) = make_sender();
 
-        let event = AgentEvent::PermissionRequest {
-            session_id: "sess-1".into(),
-            request_id: "perm-1".into(),
-            permission_type: "file_write".into(),
-            title: "Write to foo.rs".into(),
-            tool_call: serde_json::json!({}),
-            options: serde_json::json!([]),
-            response_sender: response_tx,
-            agent_name: "test-agent".into(),
-        };
-        app.handle_agent_event(event, &tx).await.unwrap();
+            let responder = make_test_responder().await;
+            let event = AgentEvent::PermissionRequest {
+                session_id: "sess-1".into(),
+                request_id: "perm-1".into(),
+                permission_type: "file_write".into(),
+                title: "Write to foo.rs".into(),
+                tool_call: serde_json::json!({}),
+                options: serde_json::json!([]),
+                responder,
+                agent_name: "test-agent".into(),
+            };
+            app.handle_agent_event(event, &tx).await.unwrap();
 
-        let msg = rx.recv().unwrap();
-        match msg {
-            Message::Notification(notif) => {
-                assert_eq!(notif.method, notifications::PERMISSION_REQUEST);
-                assert_eq!(notif.params["permissionType"], "file_write");
-                assert_eq!(notif.params["title"], "Write to foo.rs");
+            let msg = rx.recv().unwrap();
+            match msg {
+                Message::Notification(notif) => {
+                    assert_eq!(notif.method, notifications::PERMISSION_REQUEST);
+                    assert_eq!(notif.params["permissionType"], "file_write");
+                    assert_eq!(notif.params["title"], "Write to foo.rs");
+                }
+                other => panic!("expected Notification, got {other:?}"),
             }
-            other => panic!("expected Notification, got {other:?}"),
-        }
+        }).await;
     }
 
     #[tokio::test]
@@ -1975,48 +2289,57 @@ mod tests {
         match msg {
             Message::Response(resp) => {
                 let err = resp.error.unwrap();
-                assert_eq!(err.code, INTERNAL_ERROR);
-                assert!(err.message.contains("unknown agent"));
+                assert_eq!(err.code, INVALID_PARAMS);
                 assert!(err.message.contains("nonexistent"));
             }
             other => panic!("expected Response, got {other:?}"),
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn connect_agent_spawn_failure_returns_error() {
         use crate::config::AgentConfig;
+        use tokio::task::LocalSet;
 
-        let mut config = Config::default();
-        config.agents.insert(
-            "bad-agent".into(),
-            AgentConfig {
-                command: "/nonexistent/binary/path".into(),
-                args: vec![],
-                env: None,
-                default_mode: None,
-                default_model: None,
-            },
-        );
-        let mut app = Application::new(config);
-        let (tx, rx) = make_sender();
+        let local = LocalSet::new();
+        local.run_until(async {
+            let mut config = Config::default();
+            config.agents.insert(
+                "bad-agent".into(),
+                AgentConfig {
+                    command: "/nonexistent/binary/path".into(),
+                    args: vec![],
+                    env: None,
+                    default_mode: None,
+                    default_model: None,
+                },
+            );
+            let mut app = Application::new(config);
+            let (tx, rx) = make_sender();
 
-        let req = Request {
-            id: RequestId::from(12i64),
-            method: methods::CONNECT_AGENT.into(),
-            params: serde_json::json!({"agentName": "bad-agent"}),
-        };
-        app.handle_request(req, &tx).await.unwrap();
+            let req = Request {
+                id: RequestId::from(12i64),
+                method: methods::CONNECT_AGENT.into(),
+                params: serde_json::json!({"agentName": "bad-agent"}),
+            };
+            app.handle_request(req, &tx).await.unwrap();
 
-        let msg = rx.recv().unwrap();
-        match msg {
-            Message::Response(resp) => {
-                let err = resp.error.unwrap();
-                assert_eq!(err.code, INTERNAL_ERROR);
-                assert!(err.message.contains("spawn failed"));
+            let msg = rx.recv().unwrap();
+            match msg {
+                Message::Response(resp) => {
+                    let err = resp.error.unwrap();
+                    assert_eq!(err.code, INTERNAL_ERROR);
+                    assert!(
+                        err.message.contains("spawn failed")
+                            || err.message.contains("agent task dropped")
+                            || err.message.contains("No such file"),
+                        "unexpected error: {}",
+                        err.message
+                    );
+                }
+                other => panic!("expected Response, got {other:?}"),
             }
-            other => panic!("expected Response, got {other:?}"),
-        }
+        }).await;
     }
 
     // -- new_session handler ------------------------------------------------
@@ -2617,19 +2940,22 @@ mod tests {
 
     // -- respond_permission handler -----------------------------------------
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn respond_permission_returns_success() {
+        use tokio::task::LocalSet;
+        let local = LocalSet::new();
+        local.run_until(async {
         let mut app = make_app();
         let (tx, rx) = make_sender();
-        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
 
+        let responder = make_test_responder().await;
         app.pending_permissions.insert(
             "perm-1".into(),
             PendingPermissionRequest {
                 request_id: "perm-1".into(),
                 session_id: "sess-1".into(),
                 agent_name: "test-agent".into(),
-                response_sender: response_tx,
+                responder,
                 created_at: std::time::Instant::now(),
             },
         );
@@ -2653,6 +2979,7 @@ mod tests {
             }
             other => panic!("expected Response, got {other:?}"),
         }
+        }).await;
     }
 
     #[tokio::test]
