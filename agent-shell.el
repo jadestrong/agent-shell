@@ -282,11 +282,20 @@ Sources are checked in order until one returns non-nil."
 COMMAND, COMMAND-PARAMS, ENVIRONMENT-VARIABLES, and CONTEXT-BUFFER are
 passed through to `acp-make-client'."
   (let* ((full-command (append (list command) command-params))
-         (wrapped-command (agent-shell--build-command-for-execution full-command)))
+         (wrapped-command (agent-shell--build-command-for-execution full-command))
+         (agent-identifier (when context-buffer
+                             (map-nested-elt
+                              (buffer-local-value 'agent-shell--state context-buffer)
+                              '(:agent-config :identifier))))
+         (agent-name (cond
+                      ((stringp agent-identifier) agent-identifier)
+                      ((symbolp agent-identifier) (symbol-name agent-identifier))
+                      (t nil))))
     (acp-make-client :command (car wrapped-command)
                      :command-params (cdr wrapped-command)
                      :environment-variables environment-variables
                      :context-buffer context-buffer
+                     :agent-name agent-name
                      :outgoing-request-decorator (when context-buffer
                                                    (map-elt (buffer-local-value 'agent-shell--state context-buffer)
                                                             :outgoing-request-decorator)))))
@@ -1181,7 +1190,8 @@ See also `agent-shell-confirm-interrupt'."
             :client (map-elt (agent-shell--state) :client)
             :notification (acp-make-session-cancel-notification
                            :session-id (map-nested-elt (agent-shell--state) '(:session :id))
-                           :reason "User cancelled"))))
+                           :reason "User cancelled")))
+         (call-interactively #'shell-maker-interrupt))
         (t
          (agent-shell--shutdown)
          (call-interactively #'shell-maker-interrupt))))
@@ -1263,6 +1273,7 @@ Flow:
                       (not command))
              (agent-shell-heartbeat-start
               :heartbeat (map-elt agent-shell--state :heartbeat)))
+           ;; Needs ACP subscriptions
            (when-let ((viewport-buffer (agent-shell-viewport--buffer
                                         :shell-buffer shell-buffer
                                         :existing-only t)))
@@ -1273,7 +1284,6 @@ Flow:
                 :response (agent-shell-viewport--response))))
            (when (agent-shell--initialize-client)
              (agent-shell--handle :command command :shell-buffer shell-buffer)))
-          ;; Needs ACP subscriptions
           ((or (not (map-nested-elt (agent-shell--state) '(:client :request-handlers)))
                (not (map-nested-elt (agent-shell--state) '(:client :notification-handlers)))
                (not (map-nested-elt (agent-shell--state) '(:client :error-handlers))))
@@ -4508,6 +4518,7 @@ normalized server configs."
   "Subscribe SHELL and STATE to ACP events."
   (acp-subscribe-to-errors
    :client (map-elt state :client)
+   :buffer (map-elt state :buffer)
    :on-error (lambda (acp-error)
                (if (agent-shell--active-requests-p state)
                    (agent-shell--update-fragment
@@ -4526,10 +4537,12 @@ normalized server configs."
                                 "Something is up ¯\\_ (ツ)_/¯"))))))
   (acp-subscribe-to-notifications
    :client (map-elt state :client)
+   :buffer (map-elt state :buffer)
    :on-notification (lambda (acp-notification)
                       (agent-shell--on-notification :state state :acp-notification acp-notification)))
   (acp-subscribe-to-requests
    :client (map-elt state :client)
+   :buffer (map-elt state :buffer)
    :on-request (lambda (acp-request)
                  (agent-shell--on-request :state state :acp-request acp-request))))
 
