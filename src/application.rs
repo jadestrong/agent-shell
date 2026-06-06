@@ -46,6 +46,7 @@ pub mod notifications {
     pub const AUTH_REQUIRED: &str = "acp/authRequired";
     pub const FILE_CHANGED: &str = "acp/fileChanged";
     pub const AGENT_EXT_NOTIFICATION: &str = "acp/agentExtNotification";
+    pub const AGENT_STDERR: &str = "acp/agentStderr";
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +111,10 @@ pub enum AgentEvent {
         method: String,
         params: serde_json::Value,
     },
+    AgentStderr {
+        agent_name: String,
+        line: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +155,24 @@ struct ToolCallSnapshot {
 struct SessionTranscriptState {
     last_entry_type: Option<String>,
     tool_calls: HashMap<String, ToolCallSnapshot>,
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for ch in chars.by_ref() {
+                if ch == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1045,10 +1068,21 @@ impl Application {
 
         // Add stderr debug logging
         let agent_name_log = agent_name.clone();
+        let agent_name_stderr = agent_name.clone();
+        let event_tx_stderr = self.agent_event_tx.clone();
         let acp_agent = acp_agent.with_debug(move |line, dir| {
             use agent_client_protocol_tokio::LineDirection;
             match dir {
-                LineDirection::Stderr => tracing::debug!("[{} stderr] {}", agent_name_log, line),
+                LineDirection::Stderr => {
+                    tracing::debug!("[{} stderr] {}", agent_name_log, line);
+                    let stripped = strip_ansi(line);
+                    if stripped.contains("ERROR") || stripped.contains("WARN") {
+                        let _ = event_tx_stderr.send(AgentEvent::AgentStderr {
+                            agent_name: agent_name_stderr.clone(),
+                            line: stripped,
+                        });
+                    }
+                }
                 LineDirection::Stdin => tracing::trace!("[{} stdin] {}", agent_name_log, line),
                 LineDirection::Stdout => tracing::trace!("[{} stdout] {}", agent_name_log, line),
             }
@@ -1888,6 +1922,15 @@ impl Application {
                     params: serde_json::json!({
                         "method": method,
                         "params": params,
+                    }),
+                }
+            }
+            AgentEvent::AgentStderr { agent_name, line } => {
+                Notification {
+                    method: notifications::AGENT_STDERR.into(),
+                    params: serde_json::json!({
+                        "agentName": agent_name,
+                        "line": line,
                     }),
                 }
             }

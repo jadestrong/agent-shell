@@ -7,6 +7,7 @@ pub mod msg;
 
 use std::path::{Path, PathBuf};
 use std::process;
+use tracing_subscriber::fmt::time;
 
 use config::Config;
 use connection::Connection;
@@ -78,6 +79,7 @@ fn init_tracing(level: &str, log_file: Option<&Path>) {
                     .with_env_filter(filter)
                     .with_writer(file)
                     .with_ansi(false)
+                    .with_timer(time::LocalTime::rfc_3339())
                     .init();
                 return;
             }

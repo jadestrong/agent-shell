@@ -5,7 +5,7 @@
 ;; Author: Alvaro Ramirez https://xenodium.com
 ;; URL: https://github.com/xenodium/agent-shell
 ;; Version: 0.50.1
-;; Package-Requires: ((emacs "29.1") (shell-maker "0.90.1") (acp "0.11.1"))
+;; Package-Requires: ((emacs "29.1") (shell-maker "0.90.1"))
 
 (defconst agent-shell--version "0.50.1")
 
@@ -1782,6 +1782,10 @@ COMMAND, when present, may be a shell command string or an argv vector."
                                                 (cons :message (format "Agent '%s' disconnected"
                                                                        (or agent-name "?")))))
            (shell-maker-finish-output :config shell-maker--config :success nil)))
+        ((equal (map-elt acp-notification 'method) "agent/stderr")
+         (let ((agent-name (map-nested-elt acp-notification '(params agentName)))
+               (line (map-nested-elt acp-notification '(params line))))
+           (message "[%s] %s" (or agent-name "agent") line)))
         (acp-logging-enabled
          (agent-shell--update-fragment
           :state state
