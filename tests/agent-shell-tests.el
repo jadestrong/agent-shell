@@ -3373,5 +3373,62 @@ interaction (e.g. \"1/2\" after switching to the latest interaction)."
       (kill-buffer viewport-buffer)
       (kill-buffer shell-buffer))))
 
+(ert-deftest agent-shell-restart-preserves-default-directory ()
+  "Restart should use the shell's directory, not the fallback buffer's.
+
+After `kill-buffer' happens during restart, Emacs falls back to another
+buffer.  Without the fix, `default-directory' would be inherited from
+that fallback buffer, potentially starting the new shell in the wrong project."
+  (let ((shell-buffer nil)
+        (other-buffer nil)
+        (captured-dir nil)
+        (frame (make-frame '((visibility . nil))))
+        (project-a "/tmp/project-a/")
+        (project-b "/tmp/project-b/")
+        (config (list (cons :buffer-name "test-agent")
+                      (cons :client-maker
+                            (lambda (_buf)
+                              (list (cons :command "cat")))))))
+    (unwind-protect
+        (progn
+          ;; Create a buffer from "project B" that Emacs will fall back to
+          ;; after the shell buffer is killed.
+          (setq other-buffer (get-buffer-create "*project-b-file*"))
+          (with-current-buffer other-buffer
+            (setq default-directory project-b))
+          ;; Create the shell buffer in "project A".
+          (setq shell-buffer (get-buffer-create "*test-restart-shell*"))
+          (with-current-buffer shell-buffer
+            (setq major-mode 'agent-shell-mode)
+            (setq default-directory project-a)
+            (setq-local agent-shell-session-strategy 'new)
+            (setq-local agent-shell--state
+                        `((:agent-config . ,config)
+                          (:active-requests))))
+          ;; Use a hidden frame and swap buffers around
+          ;; so that when kill-buffer happens it will fallback to project-b
+          ;; rather than the last buffer in the user's frame.
+          (with-selected-frame frame
+            (switch-to-buffer other-buffer)
+            (switch-to-buffer shell-buffer)
+            ;; Mock agent-shell--start to capture default-directory
+            ;; instead of actually starting a shell.
+            (cl-letf (((symbol-function 'agent-shell--start)
+                       (lambda (&rest _args)
+                         (setq captured-dir default-directory)
+                         (get-buffer-create "*test-restart-new-shell*")))
+                      ((symbol-function 'agent-shell--display-buffer)
+                       #'ignore))
+              (agent-shell-restart)))
+          (should (equal captured-dir project-a)))
+      (when (and frame (frame-live-p frame))
+        (delete-frame frame))
+      (when (and shell-buffer (buffer-live-p shell-buffer))
+        (kill-buffer shell-buffer))
+      (when (and other-buffer (buffer-live-p other-buffer))
+        (kill-buffer other-buffer))
+      (when-let ((buf (get-buffer "*test-restart-new-shell*")))
+        (kill-buffer buf)))))
+
 (provide 'agent-shell-tests)
 ;;; agent-shell-tests.el ends here
