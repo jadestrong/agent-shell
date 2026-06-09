@@ -369,11 +369,20 @@ Sources are checked in order until one returns non-nil."
 COMMAND, COMMAND-PARAMS, ENVIRONMENT-VARIABLES, and CONTEXT-BUFFER are
 passed through to `acp-make-client'."
   (let* ((full-command (append (list command) command-params))
-         (wrapped-command (agent-shell--build-command-for-execution full-command)))
+         (wrapped-command (agent-shell--build-command-for-execution full-command))
+         (agent-identifier (when context-buffer
+                             (map-nested-elt
+                              (buffer-local-value 'agent-shell--state context-buffer)
+                              '(:agent-config :identifier))))
+         (agent-name (cond
+                      ((stringp agent-identifier) agent-identifier)
+                      ((symbolp agent-identifier) (symbol-name agent-identifier))
+                      (t nil))))
     (acp-make-client :command (car wrapped-command)
                      :command-params (cdr wrapped-command)
                      :environment-variables environment-variables
                      :context-buffer context-buffer
+                     :agent-name agent-name
                      :outgoing-request-decorator (when context-buffer
                                                    (map-elt (buffer-local-value 'agent-shell--state context-buffer)
                                                             :outgoing-request-decorator)))))
@@ -1845,7 +1854,8 @@ See also `agent-shell-confirm-interrupt'."
             :client (map-elt (agent-shell--state) :client)
             :notification (acp-make-session-cancel-notification
                            :session-id (map-nested-elt (agent-shell--state) '(:session :id))
-                           :reason "User cancelled"))))
+                           :reason "User cancelled")))
+         (call-interactively #'shell-maker-interrupt))
         (t
          (agent-shell--shutdown)
          (call-interactively #'shell-maker-interrupt))))
@@ -1958,7 +1968,6 @@ Flow:
                 :response (agent-shell-viewport--response))))
            (when (agent-shell--initialize-client)
              (agent-shell--handle :command command :shell-buffer shell-buffer)))
-          ;; Needs ACP subscriptions
           ((or (not (map-nested-elt (agent-shell--state) '(:client :request-handlers)))
                (not (map-nested-elt (agent-shell--state) '(:client :notification-handlers)))
                (not (map-nested-elt (agent-shell--state) '(:client :error-handlers))))
@@ -2945,6 +2954,43 @@ No-op while that function has nothing to summarize (an empty group)."
             :append t
             :above-last-prompt (not (shell-maker-busy)))
            (map-put! state :last-entry-type nil))))
+        ((equal (map-elt acp-notification 'method) "agent/ext-notification")
+         (let* ((orig-method (map-nested-elt acp-notification '(params method)))
+                (orig-params (map-nested-elt acp-notification '(params params))))
+           (cond
+            ((and orig-method
+                  (string-match-p "rate.limit\\|error/rate" orig-method))
+             (agent-shell--update-fragment
+              :state state
+              :block-id (format "%s-rate-limit" (map-elt state :request-count))
+              :body (or (map-elt orig-params 'message)
+                        "Rate limit exceeded. Please wait a moment before trying again.")
+              :create-new t)
+             (map-put! state :last-entry-type nil))
+            (acp-logging-enabled
+             (message "Agent ext notification: %s" orig-method)))))
+        ((equal (map-elt acp-notification 'method) "agent/disconnected")
+         (agent-shell-heartbeat-stop :heartbeat (map-elt state :heartbeat))
+         (let ((exit-code (map-nested-elt acp-notification '(params exitCode)))
+               (agent-name (map-nested-elt acp-notification '(params agentName))))
+           (agent-shell--update-fragment
+            :state state
+            :block-id (format "agent-disconnected-%s" (map-elt state :request-count))
+            :body (agent-shell--make-error-dialog-text
+                   :code exit-code
+                   :message (format "Agent '%s' disconnected (exit code: %s)"
+                                    (or agent-name "?")
+                                    (or exit-code "unknown")))
+            :create-new t)
+           (agent-shell--emit-event :event 'error
+                                    :data (list (cons :code exit-code)
+                                                (cons :message (format "Agent '%s' disconnected"
+                                                                       (or agent-name "?")))))
+           (shell-maker-finish-output :config shell-maker--config :success nil)))
+        ((equal (map-elt acp-notification 'method) "agent/stderr")
+         (let ((agent-name (map-nested-elt acp-notification '(params agentName)))
+               (line (map-nested-elt acp-notification '(params line))))
+           (message "[%s] %s" (or agent-name "agent") line)))
         (acp-logging-enabled
          (agent-shell--update-fragment
           :state state
@@ -5634,7 +5680,7 @@ through to `acp-send-request'."
                                        (map-elt state :active-requests)))
                  (when on-success
                    (funcall on-success acp-response)))
-   :on-failure (lambda (acp-error raw-message)
+   :on-failure (lambda (acp-error &optional raw-message)
                  (map-put! state :active-requests
                            (seq-remove (lambda (r)
                                          (equal r request))
@@ -6784,6 +6830,7 @@ The agent config's `:mcp-servers' take precedence over the global
   "Subscribe SHELL and STATE to ACP events."
   (acp-subscribe-to-errors
    :client (map-elt state :client)
+   :buffer (map-elt state :buffer)
    :on-error (lambda (acp-error)
                (agent-shell--update-fragment
                 :state state
@@ -6797,6 +6844,7 @@ The agent config's `:mcp-servers' take precedence over the global
                 :above-last-prompt (not (shell-maker-busy)))))
   (acp-subscribe-to-notifications
    :client (map-elt state :client)
+   :buffer (map-elt state :buffer)
    :on-notification (lambda (acp-notification)
                       (agent-shell--on-notification
                        :state state
@@ -6807,6 +6855,7 @@ The agent config's `:mcp-servers' take precedence over the global
                        )))
   (acp-subscribe-to-requests
    :client (map-elt state :client)
+   :buffer (map-elt state :buffer)
    :on-request (lambda (acp-request)
                  (agent-shell--on-request :state state :acp-request acp-request))))
 
@@ -7273,7 +7322,7 @@ Each marked span is replaced by its `agent-shell-region-text' value."
                          (agent-shell-viewport--update-header)))
                      (when success
                        (agent-shell--process-pending-request))))
-     :on-failure (lambda (acp-error raw-message)
+     :on-failure (lambda (acp-error &optional raw-message)
                    ;; A failed/interrupted turn may have stopped mid
                    ;; agent_message_chunk, leaving the transcript body
                    ;; without a trailing newline.  Separate it so the
