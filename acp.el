@@ -72,10 +72,15 @@
   (setq acp--shared-client-list (delq client acp--shared-client-list)))
 
 (defun acp--shared-target-clients (method params)
-  "Return shared clients that should handle METHOD with PARAMS."
-  (let* ((method-name (if (symbolp method) (symbol-name method) method))
-         (session-id (acp--get params 'sessionId))
-         (clients acp--shared-client-list))
+  "Return shared clients that should handle METHOD with PARAMS.
+
+When PARAMS carries a sessionId, only the client(s) owning that
+session are returned (possibly none).  Otherwise every client is
+returned.  A client's session is its own :session-id when set,
+falling back to the session id stored in its context buffer."
+  (ignore method)
+  (let ((session-id (acp--get params 'sessionId))
+        (clients acp--shared-client-list))
     (cl-labels
         ((client-session-id (client)
            (or (map-elt client :session-id)
@@ -85,25 +90,38 @@
                    (when (and (boundp 'agent-shell--state)
                               (bound-and-true-p agent-shell--state))
                      (map-nested-elt agent-shell--state '(:session :id))))))))
-    (cond
-     ((and session-id
-           (member method-name '("acp/sessionUpdate" "acp/permissionRequest")))
-      (or (seq-filter (lambda (client)
+      (if session-id
+          (seq-filter (lambda (client)
                         (equal (client-session-id client) session-id))
                       clients)
-          nil))
-     (t clients)))))
+        clients))))
 
 (defun acp--shared-dispatch-notification (method params)
-  "Dispatch a proxy notification to the appropriate shared client(s)."
-  (let ((clients (acp--shared-target-clients method params)))
-    (dolist (client (or clients acp--shared-client-list))
-      (acp--jsonrpc-notification-dispatcher client method params))))
+  "Dispatch a proxy notification to the appropriate shared client(s).
+
+Session-scoped notifications (those carrying a sessionId) are delivered
+only to the client owning that session, and dropped when no client owns
+it.  This prevents cross-talk between buffers that share the single
+proxy connection.  Connection-level notifications go to every client."
+  (let ((session-id (acp--get params 'sessionId))
+        (clients (acp--shared-target-clients method params)))
+    (if session-id
+        (dolist (client clients)
+          (acp--jsonrpc-notification-dispatcher client method params))
+      (dolist (client (or clients acp--shared-client-list))
+        (acp--jsonrpc-notification-dispatcher client method params)))))
 
 (defun acp--shared-dispatch-request (method params)
-  "Dispatch a proxy request to a single appropriate shared client."
-  (let* ((clients (acp--shared-target-clients method params))
-         (client (or (car clients) (car acp--shared-client-list))))
+  "Dispatch a proxy request to a single appropriate shared client.
+
+A request carrying a sessionId is routed to the client owning that
+session.  Requests without a sessionId fall back to the most recently
+registered client so the proxy always receives a response."
+  (let* ((session-id (acp--get params 'sessionId))
+         (clients (acp--shared-target-clients method params))
+         (client (if session-id
+                     (car clients)
+                   (or (car clients) (car acp--shared-client-list)))))
     (when client
       (acp--jsonrpc-request-dispatcher client method params))))
 
@@ -188,6 +206,9 @@ Other arguments match acp.el semantics."
     (error ":command (or :agent-name) is required"))
   (list (cons :context-buffer context-buffer)
         (cons :instance-count (acp--increment-instance-count))
+        ;; Pre-declared so `acp-set-session-id' can `map-put!' it in place
+        ;; once a session is established (used for notification routing).
+        (cons :session-id nil)
         (cons :process nil)
         (cons :connection nil)
         (cons :command command)
@@ -468,6 +489,23 @@ When SYNC is nil, invoke ON-SUCCESS/ON-FAILURE asynchronously."
 ;; ---------------------------------------------------------------------------
 ;; Subscription APIs (compatible with acp.el)
 ;; ---------------------------------------------------------------------------
+
+(defun acp-set-session-id (client session-id)
+  "Associate SESSION-ID with CLIENT for notification routing.
+
+The shared proxy multiplexes every session over one connection, so
+incoming notifications are routed to clients by sessionId.  Stamping
+the id here gives `acp--shared-target-clients' a reliable key instead
+of relying solely on the client's context buffer.
+
+Updates the alist in place so the change is visible to every holder of
+CLIENT, appending the key when absent.  `map-put!' is avoided here
+because it raises `map-not-inplace' when adding a new key to an alist
+\(e.g. for a client built before :session-id was pre-declared)."
+  (when client
+    (if-let* ((cell (assq :session-id client)))
+        (setcdr cell session-id)
+      (nconc client (list (cons :session-id session-id))))))
 
 (cl-defun acp-subscribe-to-notifications (&key client on-notification buffer)
   "Subscribe to incoming CLIENT notifications.

@@ -1822,10 +1822,26 @@ pretty-printed JSON inside a json fence."
               (json-pretty-print-buffer)
               (buffer-string)))))
 
+(defun agent-shell--foreign-session-notification-p (state acp-notification)
+  "Return non-nil when ACP-NOTIFICATION belongs to a session other than STATE's.
+
+The shared proxy connection is multiplexed across buffers and routes by
+sessionId.  This guards against a notification ever being rendered in a
+buffer that does not own its session."
+  (when-let* ((notification-session (map-nested-elt acp-notification '(params sessionId)))
+              (own-session (map-nested-elt state '(:session :id))))
+    (not (equal notification-session own-session))))
+
 (cl-defun agent-shell--on-notification (&key state acp-notification)
   "Handle incoming ACP-NOTIFICATION using STATE."
   (map-put! state :last-activity-time (current-time))
-  (cond ((and (not (agent-shell--active-requests-p state))
+  (cond ((agent-shell--foreign-session-notification-p state acp-notification)
+         ;; Defensive: never render another session's output in this buffer.
+         (when acp-logging-enabled
+           (message "agent-shell: dropped notification for session %s (buffer owns %s)"
+                    (map-nested-elt acp-notification '(params sessionId))
+                    (map-nested-elt state '(:session :id)))))
+        ((and (not (agent-shell--active-requests-p state))
               (agent-shell--session-bound-notification-p acp-notification))
          ;; Turn-bound notification arriving with no agent request in
          ;; flight is a protocol violation: these notifications must
@@ -5150,6 +5166,7 @@ Falls back to latest session in batch mode (e.g. tests)."
             :session (agent-shell--session-from-response
                       :acp-response acp-response
                       :acp-session-id acp-session-id))
+  (acp-set-session-id (map-elt agent-shell--state :client) acp-session-id)
   (agent-shell--save-config-options
    :state agent-shell--state
    :acp-config-options (map-elt acp-response 'configOptions)))
@@ -5249,6 +5266,8 @@ overwrites an existing fragment with equivalent content."
                            :session (agent-shell--session-from-response
                                      :acp-response acp-response
                                      :acp-session-id (map-elt acp-response 'sessionId)))
+                 (acp-set-session-id (map-elt agent-shell--state :client)
+                                     (map-elt acp-response 'sessionId))
                  (agent-shell--save-config-options
                   :state agent-shell--state
                   :acp-config-options (map-elt acp-response 'configOptions))
