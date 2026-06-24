@@ -105,11 +105,7 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                 (let* ((state (get-text-property (prop-match-beginning match)
                                                  'agent-shell-ui-state))
                        (collapsed (map-elt state :collapsed))
-                       (existing-body-range
-                        (agent-shell-ui--nearest-range-matching-property
-                         :property 'agent-shell-ui-section :value 'body
-                         :from (prop-match-beginning match)
-                         :to (prop-match-end match))))
+                       (existing-body-range nil))
                   (setq block-start (prop-match-beginning match))
                   (save-excursion
                     (goto-char block-start)
@@ -121,6 +117,22 @@ O(accumulated-body).  Label-only updates leave the body untouched."
                   (when new-label-right
                     (agent-shell-ui--replace-label
                      qualified-id 'label-right new-label-right))
+                  ;; Derive the body range *after* the label edits.
+                  ;; `agent-shell-ui--replace-label' can change a label's
+                  ;; length (e.g. the status label growing from "pending"
+                  ;; to "completed"), shifting every position to its right.
+                  ;; A range captured before the edits would be stale and
+                  ;; make `--replace-body' delete the wrong region, eating
+                  ;; the label↔body boundary and leaving the body visible
+                  ;; under a collapsed `▶' indicator.
+                  (setq existing-body-range
+                        (when-let* ((block-range
+                                     (agent-shell-ui--block-range
+                                      :position block-start)))
+                          (agent-shell-ui--nearest-range-matching-property
+                           :property 'agent-shell-ui-section :value 'body
+                           :from (map-elt block-range :start)
+                           :to (map-elt block-range :end))))
                   (when new-body
                     (cond
                      ;; Append to existing body — preserves rendered content.

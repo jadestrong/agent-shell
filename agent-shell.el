@@ -2078,17 +2078,24 @@ buffer that does not own its session."
               :navigation 'never))
            (agent-shell--cancel-idle-timer)
            (agent-shell--emit-event
-            :event 'tool-call-update
+           :event 'tool-call-update
             :data (list (cons :tool-call-id (map-nested-elt acp-notification '(params update toolCallId)))
                         (cons :tool-call (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)))))))
            (let* ((diff (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)) :diff)))
+                  ;; Render from the persisted `:content' rather than this
+                  ;; notification's content.  Some agents stream the output
+                  ;; in an earlier `tool_call_update' and then send the
+                  ;; "completed" update with only `rawOutput' (no
+                  ;; `content'); `agent-shell--save-tool-call' preserves the
+                  ;; streamed content (it drops nil overrides), so reading
+                  ;; from state keeps the output visible on completion.
                   (output (concat
                            "\n\n"
                            ;; TODO: Consider if there are other
                            ;; types of content to display.
                            (mapconcat (lambda (item)
                                         (map-nested-elt item '(content text)))
-                                      (map-nested-elt acp-notification '(params update content))
+                                      (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)) :content))
                                       "\n\n")
                            "\n\n"))
                   (diff-text (agent-shell--format-diff-as-text diff))
