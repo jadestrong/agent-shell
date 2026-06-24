@@ -3293,14 +3293,29 @@ Clears STATE's `:expanded-activity-group'."
               :above-last-prompt (not (agent-shell--active-requests-p state))))
            (agent-shell--cancel-idle-timer)
            (agent-shell--emit-event
-            :event 'tool-call-update
+           :event 'tool-call-update
             :data (list (cons :tool-call-id (map-nested-elt acp-notification '(params update toolCallId)))
                         (cons :tool-call (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)))))))
            (let* ((diffs (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)) :diffs)))
+                  ;; Render from the persisted `:content' rather than this
+                  ;; notification's content.  Some agents stream the output
+                  ;; in an earlier `tool_call_update' and then send the
+                  ;; "completed" update with only `rawOutput' (no
+                  ;; `content'); `agent-shell--save-tool-call' preserves the
+                  ;; streamed content (it drops nil overrides), so reading
+                  ;; from state keeps the output visible on completion.
                   (output (concat
                            "\n\n"
-                           (agent-shell--tool-call-update-output-markdown
-                            (map-nested-elt acp-notification '(params update)))
+                           (if-let* ((persisted-content
+                                      (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)) :content))))
+                               (mapconcat #'agent-shell--content-block-to-markdown
+                                          (seq-keep (lambda (item) (map-elt item 'content)) persisted-content)
+                                          "\n\n")
+                             ;; No persisted content yet (e.g. first update
+                             ;; for this tool call) -- fall back to the
+                             ;; notification's own content/rawOutput.
+                             (agent-shell--tool-call-update-output-markdown
+                              (map-nested-elt acp-notification '(params update))))
                            "\n\n"))
                   (diff-text (agent-shell--format-diffs-as-text diffs))
                   (body-text (if diff-text
