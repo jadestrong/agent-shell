@@ -37,6 +37,63 @@
       (should (equal "  " (get-text-property i 'line-prefix out)))
       (should (equal "  " (get-text-property i 'wrap-prefix out))))))
 
+(ert-deftest agent-shell-ui-label-length-change-preserves-body-collapse ()
+  ;; Regression: a collapsed fragment that already has a body gets an
+  ;; update where the label-left changes length (e.g. the status label
+  ;; growing from a short kind label to "[ completed ]") together with a
+  ;; new body.  `agent-shell-ui-update-fragment' must derive the body
+  ;; range *after* rewriting the labels — a range captured beforehand is
+  ;; shifted by the label-length delta and points into the (visible)
+  ;; label-right, so `--replace-body' eats the label↔body boundary and
+  ;; inserts the body visible under a collapsed `▶' indicator.  This is
+  ;; most visible on `execute' (run) tool calls, whose status label grows
+  ;; on completion.
+  (cl-flet ((section-text (section)
+              (when-let* ((r (agent-shell-ui--nearest-range-matching-property
+                              :property 'agent-shell-ui-section :value section
+                              :from (point-min) :to (point-max))))
+                (buffer-substring-no-properties (map-elt r :start) (map-elt r :end))))
+            (body-invisible-p ()
+              (when-let* ((r (agent-shell-ui--nearest-range-matching-property
+                              :property 'agent-shell-ui-section :value 'body
+                              :from (point-min) :to (point-max))))
+                (eq (get-text-property (map-elt r :start) 'invisible) t))))
+    (with-temp-buffer
+      ;; Labels-only, collapsed.
+      (agent-shell-ui-update-fragment
+       (agent-shell-ui-make-fragment-model
+        :namespace-id 1 :block-id "tc"
+        :label-left "[p]" :label-right "RIGHT-LABEL" :body nil)
+       :expanded nil :no-undo t)
+      ;; Body arrives, still collapsed.
+      (agent-shell-ui-update-fragment
+       (agent-shell-ui-make-fragment-model
+        :namespace-id 1 :block-id "tc"
+        :label-left "[p]" :label-right "RIGHT-LABEL" :body "FIRST BODY")
+       :expanded nil :no-undo t)
+      (should (body-invisible-p))
+      (should (equal (section-text 'label-right) "RIGHT-LABEL"))
+      ;; Completion: label-left grows (delta exceeds the label↔body
+      ;; separator) and the body is replaced.
+      (agent-shell-ui-update-fragment
+       (agent-shell-ui-make-fragment-model
+        :namespace-id 1 :block-id "tc"
+        :label-left "[ a much longer completed status label ]"
+        :label-right "RIGHT-LABEL" :body "SECOND BODY")
+       :expanded nil :no-undo t)
+      ;; Label-right must survive intact (not partially deleted).
+      (should (equal (section-text 'label-right) "RIGHT-LABEL"))
+      ;; Body must stay collapsed (invisible) to match the `▶' indicator.
+      (should (body-invisible-p))
+      ;; And the replacement body content must be present.
+      (when-let* ((r (agent-shell-ui--nearest-range-matching-property
+                      :property 'agent-shell-ui-section :value 'body
+                      :from (point-min) :to (point-max))))
+        (should (string-match-p
+                 "SECOND BODY"
+                 (buffer-substring-no-properties (map-elt r :start)
+                                                 (map-elt r :end))))))))
+
 (provide 'agent-shell-ui-tests)
 
 ;;; agent-shell-ui-tests.el ends here
