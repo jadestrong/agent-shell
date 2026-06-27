@@ -1641,11 +1641,22 @@ impl Application {
             }
         };
 
+        let meta = params.get("_meta").cloned().map(|meta| {
+            serde_json::from_value(meta).map_err(|e| {
+                tracing::warn!("invalid authenticate _meta for agent {}: {}", agent_name, e);
+                Response::new_err(id.clone(), INVALID_PARAMS, "invalid _meta".into())
+            })
+        });
+        let meta = match meta.transpose() {
+            Ok(meta) => meta,
+            Err(response) => return response,
+        };
+
         // Forward authenticate request to the agent
         let connection = agent.connection.clone();
-        let request = acp::schema::AuthenticateRequest::new(
-            acp::schema::AuthMethodId::new(auth_method_id),
-        );
+        let mut request =
+            acp::schema::AuthenticateRequest::new(acp::schema::AuthMethodId::new(auth_method_id));
+        request.meta = meta;
         match connection.send_request(request).block_task().await {
             Ok(_response) => Response::new_ok(id, serde_json::json!({})),
             Err(e) => {
