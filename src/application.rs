@@ -32,6 +32,8 @@ pub mod methods {
     pub const AUTHENTICATE: &str = "acp/authenticate";
     pub const SET_MODEL: &str = "acp/setModel";
     pub const SET_MODE: &str = "acp/setMode";
+    pub const SET_CONFIG_OPTION: &str = "acp/setConfigOption";
+    pub const FORK_SESSION: &str = "acp/forkSession";
     pub const RESPOND_PERMISSION: &str = "acp/respondPermission";
 }
 
@@ -965,6 +967,14 @@ impl Application {
                 self.handle_set_mode(req.id.clone(), req.params.clone())
                     .await
             }
+            methods::SET_CONFIG_OPTION => {
+                self.handle_set_config_option(req.id.clone(), req.params.clone())
+                    .await
+            }
+            methods::FORK_SESSION => {
+                self.handle_fork_session(req.id.clone(), req.params.clone(), emacs_sender)
+                    .await
+            }
             methods::RESPOND_PERMISSION => {
                 self.handle_respond_permission(req.id.clone(), req.params.clone())
             }
@@ -1792,6 +1802,205 @@ impl Application {
         }
     }
 
+    async fn handle_set_config_option(
+        &mut self,
+        id: crate::msg::RequestId,
+        params: serde_json::Value,
+    ) -> Response {
+        // Parse sessionId from params (required)
+        let session_id = match params.get("sessionId").and_then(|v| v.as_str()) {
+            Some(sid) => sid.to_string(),
+            None => {
+                return Response::new_err(id, INVALID_PARAMS, "missing sessionId".into());
+            }
+        };
+
+        // Parse configId from params (required)
+        let config_id = match params.get("configId").and_then(|v| v.as_str()) {
+            Some(cid) => cid.to_string(),
+            None => {
+                return Response::new_err(id, INVALID_PARAMS, "missing configId".into());
+            }
+        };
+
+        // Parse value from params (required). For `select` config options this
+        // is the value id string; that is the stable wire shape this proxy
+        // forwards (boolean config options are an unstable feature not enabled
+        // here).
+        let value = match params.get("value").and_then(|v| v.as_str()) {
+            Some(val) => val.to_string(),
+            None => {
+                return Response::new_err(
+                    id,
+                    INVALID_PARAMS,
+                    "missing or non-string value".into(),
+                );
+            }
+        };
+
+        // Find the session to get the agent name
+        let agent_name = match self.sessions.get(&session_id) {
+            Some(session) => session.agent_name.clone(),
+            None => {
+                return Response::new_err(
+                    id,
+                    INTERNAL_ERROR,
+                    format!("session not found: {}", session_id),
+                );
+            }
+        };
+
+        // Find the agent
+        let agent = match self.agents.get(&agent_name) {
+            Some(a) => a,
+            None => {
+                return Response::new_err(
+                    id,
+                    INTERNAL_ERROR,
+                    format!("agent not connected: {}", agent_name),
+                );
+            }
+        };
+
+        // Forward set_config_option request to the agent
+        let connection = agent.connection.clone();
+        let acp_session_id = acp::schema::SessionId::new(session_id.clone());
+        let acp_config_id = acp::schema::SessionConfigId::new(config_id);
+        let acp_value = acp::schema::SessionConfigValueId::new(value);
+        let request =
+            acp::schema::SetSessionConfigOptionRequest::new(acp_session_id, acp_config_id, acp_value);
+        match connection.send_request(request).block_task().await {
+            Ok(resp) => match serde_json::to_value(&resp) {
+                Ok(val) => Response::new_ok(id, val),
+                Err(e) => Response::new_err(
+                    id,
+                    INTERNAL_ERROR,
+                    format!("failed to serialize SetSessionConfigOptionResponse: {}", e),
+                ),
+            },
+            Err(e) => {
+                tracing::warn!(
+                    "set_config_option failed for session {}: {}",
+                    session_id,
+                    e
+                );
+                Response::new_err(
+                    id,
+                    INTERNAL_ERROR,
+                    format!("set_config_option failed: {}", e),
+                )
+            }
+        }
+    }
+
+    async fn handle_fork_session(
+        &mut self,
+        id: crate::msg::RequestId,
+        params: serde_json::Value,
+        emacs_sender: &Sender<Message>,
+    ) -> Response {
+        // Parse sessionId of the session to fork from (required)
+        let source_session_id = match params.get("sessionId").and_then(|v| v.as_str()) {
+            Some(sid) => sid.to_string(),
+            None => {
+                return Response::new_err(id, INVALID_PARAMS, "missing sessionId".into());
+            }
+        };
+
+        // Parse cwd for the forked session (required)
+        let cwd = match params.get("cwd").and_then(|v| v.as_str()) {
+            Some(c) => c.to_string(),
+            None => {
+                return Response::new_err(id, INVALID_PARAMS, "missing cwd".into());
+            }
+        };
+
+        // Find the source session to inherit its agent.
+        let agent_name = match self.sessions.get(&source_session_id) {
+            Some(session) => session.agent_name.clone(),
+            None => {
+                return Response::new_err(
+                    id,
+                    INTERNAL_ERROR,
+                    format!("session not found: {}", source_session_id),
+                );
+            }
+        };
+
+        // Find the agent
+        let connection = match self.agents.get(&agent_name) {
+            Some(a) => a.connection.clone(),
+            None => {
+                return Response::new_err(
+                    id,
+                    INTERNAL_ERROR,
+                    format!("agent not connected: {}", agent_name),
+                );
+            }
+        };
+
+        // Forward fork request to the agent.
+        let acp_session_id = acp::schema::SessionId::new(source_session_id.clone());
+        let request = acp::schema::ForkSessionRequest::new(acp_session_id, cwd.clone());
+        match connection.send_request(request).block_task().await {
+            Ok(resp) => {
+                let new_session_id = resp.session_id.to_string();
+
+                // Register the forked session under the same agent.
+                self.sessions.insert(
+                    new_session_id.clone(),
+                    SessionState {
+                        id: new_session_id.clone(),
+                        agent_name: agent_name.clone(),
+                        status: SessionStatus::Active,
+                        message_state: SessionMessageState::default(),
+                    },
+                );
+                self.init_session_transcript(&new_session_id, &agent_name, &cwd);
+
+                // Build response mirroring acp/newSession.
+                let mut result = serde_json::json!({
+                    "sessionId": new_session_id,
+                });
+
+                if let Some(modes) = &resp.modes {
+                    result["modes"] = serde_json::to_value(modes).unwrap_or_default();
+                }
+
+                if let Some(models) = &resp.models {
+                    result["models"] = serde_json::to_value(models).unwrap_or_default();
+                }
+
+                if let Some(config_options) = &resp.config_options {
+                    result["configOptions"] =
+                        serde_json::to_value(config_options).unwrap_or_default();
+                }
+
+                Response::new_ok(id, result)
+            }
+            Err(e) => {
+                // Surface AuthRequired the same way new_session does.
+                if e.code == acp::schema::ErrorCode::AuthRequired.into() {
+                    let notif = Notification {
+                        method: notifications::AUTH_REQUIRED.into(),
+                        params: serde_json::json!({
+                            "agentName": agent_name,
+                            "message": e.message,
+                        }),
+                    };
+                    let _ = emacs_sender.send(Message::Notification(notif));
+                    return Response::new_err(id, AUTH_REQUIRED, e.message);
+                }
+                tracing::warn!(
+                    "fork_session failed for session {}: {}",
+                    source_session_id,
+                    e
+                );
+                Response::new_err(id, INTERNAL_ERROR, format!("fork_session failed: {}", e))
+            }
+        }
+    }
+
     fn handle_respond_permission(
         &mut self,
         id: crate::msg::RequestId,
@@ -2085,6 +2294,8 @@ mod tests {
             methods::AUTHENTICATE,
             methods::SET_MODEL,
             methods::SET_MODE,
+            methods::SET_CONFIG_OPTION,
+            methods::FORK_SESSION,
             methods::RESPOND_PERMISSION,
         ];
 
@@ -2603,6 +2814,106 @@ mod tests {
                 let err = resp.error.unwrap();
                 assert_eq!(err.code, INTERNAL_ERROR);
                 assert!(err.message.contains("agent not connected"));
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+    }
+
+    // -- set_config_option handler ------------------------------------------
+
+    #[tokio::test]
+    async fn set_config_option_missing_value_returns_invalid_params() {
+        let mut app = make_app();
+        let (tx, rx) = make_sender();
+
+        let req = Request {
+            id: RequestId::from(60i64),
+            method: methods::SET_CONFIG_OPTION.into(),
+            params: serde_json::json!({"sessionId": "sess-1", "configId": "model"}),
+        };
+        app.handle_request(req, &tx).await.unwrap();
+
+        let msg = rx.recv().unwrap();
+        match msg {
+            Message::Response(resp) => {
+                let err = resp.error.unwrap();
+                assert_eq!(err.code, INVALID_PARAMS);
+                assert!(err.message.contains("value"));
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_config_option_unknown_session_returns_error() {
+        let mut app = make_app();
+        let (tx, rx) = make_sender();
+
+        let req = Request {
+            id: RequestId::from(61i64),
+            method: methods::SET_CONFIG_OPTION.into(),
+            params: serde_json::json!({
+                "sessionId": "nonexistent",
+                "configId": "model",
+                "value": "gpt-5"
+            }),
+        };
+        app.handle_request(req, &tx).await.unwrap();
+
+        let msg = rx.recv().unwrap();
+        match msg {
+            Message::Response(resp) => {
+                let err = resp.error.unwrap();
+                assert_eq!(err.code, INTERNAL_ERROR);
+                assert!(err.message.contains("session not found"));
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+    }
+
+    // -- fork_session handler -----------------------------------------------
+
+    #[tokio::test]
+    async fn fork_missing_cwd_returns_invalid_params() {
+        let mut app = make_app();
+        let (tx, rx) = make_sender();
+
+        let req = Request {
+            id: RequestId::from(62i64),
+            method: methods::FORK_SESSION.into(),
+            params: serde_json::json!({"sessionId": "sess-1"}),
+        };
+        app.handle_request(req, &tx).await.unwrap();
+
+        let msg = rx.recv().unwrap();
+        match msg {
+            Message::Response(resp) => {
+                let err = resp.error.unwrap();
+                assert_eq!(err.code, INVALID_PARAMS);
+                assert!(err.message.contains("missing cwd"));
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_unknown_session_returns_error() {
+        let mut app = make_app();
+        let (tx, rx) = make_sender();
+
+        let req = Request {
+            id: RequestId::from(63i64),
+            method: methods::FORK_SESSION.into(),
+            params: serde_json::json!({"sessionId": "nonexistent", "cwd": "/tmp"}),
+        };
+        app.handle_request(req, &tx).await.unwrap();
+
+        let msg = rx.recv().unwrap();
+        match msg {
+            Message::Response(resp) => {
+                let err = resp.error.unwrap();
+                assert_eq!(err.code, INTERNAL_ERROR);
+                assert!(err.message.contains("session not found"));
             }
             other => panic!("expected Response, got {other:?}"),
         }
