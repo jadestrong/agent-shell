@@ -612,10 +612,13 @@ and invoked with BUFFER as current."
       ("authenticate"
        (let ((agent-name (or (map-elt client :agent-name)
                              (error ":agent-name is required")))
-             (method-id (acp--get params 'methodId)))
+             (method-id (acp--get params 'methodId))
+             (meta (acp--get params '_meta)))
          (list "acp/authenticate"
-               (list :agentName agent-name
-                     :authMethodId method-id)
+               (append (list :agentName agent-name
+                             :authMethodId method-id)
+                       (when meta
+                         (list :_meta meta)))
                (lambda (result) result))))
       ("session/new"
        (let ((agent-name (or (map-elt client :agent-name)
@@ -978,14 +981,16 @@ When non-nil SYNC, send notification synchronously."
                 (clientCapabilities . ((fs . ((readTextFile . ,(if read-text-file-capability t :false))
                                               (writeTextFile . ,(if write-text-file-capability t :false))))))))))
 
-(cl-defun acp-make-authenticate-request (&key method-id method)
-  "Instantiate an \"authenticate\" request." 
+(cl-defun acp-make-authenticate-request (&key method-id method meta)
+  "Instantiate an \"authenticate\" request."
   (unless method-id
     (error ":method-id is required"))
   `((:method . "authenticate")
     (:params . ,(append `((methodId . ,method-id))
                         (when method
-                          `((authMethod . ,method)))))))
+                          `((authMethod . ,method)))
+                        (when meta
+                          `((_meta . ,meta)))))))
 
 (cl-defun acp-make-session-new-request (&key cwd mcp-servers meta)
   "Instantiate a \"session/new\" request." 

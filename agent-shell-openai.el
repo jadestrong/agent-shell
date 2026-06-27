@@ -145,12 +145,16 @@ Returns an agent configuration alist using `agent-shell-make-agent-config'."
                                   agent-shell-openai-default-model-id))
    :default-session-mode-id (lambda () agent-shell-openai-default-session-mode-id)
    :authenticate-request-maker (lambda ()
-                                 (cond ((map-elt agent-shell-openai-authentication :api-key)
-                                        (acp-make-authenticate-request :method-id "openai-api-key"))
-                                       ((map-elt agent-shell-openai-authentication :codex-api-key)
-                                        (acp-make-authenticate-request :method-id "codex-api-key"))
+                                 (cond ((or (map-elt agent-shell-openai-authentication :api-key)
+                                            (map-elt agent-shell-openai-authentication :codex-api-key))
+                                        (let ((api-key (agent-shell-openai-key)))
+                                          (unless api-key
+                                            (user-error "Please set your `agent-shell-openai-authentication'"))
+                                          (acp-make-authenticate-request
+                                           :method-id "api-key"
+                                           :meta `((api-key . ((apiKey . ,api-key)))))))
                                        (t
-                                        (acp-make-authenticate-request :method-id "chatgpt"))))
+                                        (acp-make-authenticate-request :method-id "chat-gpt"))))
    :client-maker (lambda (buffer)
                    (agent-shell-openai-make-codex-client :buffer buffer))
    :install-instructions "See https://github.com/zed-industries/codex-acp for installation."))
@@ -185,14 +189,13 @@ Uses `agent-shell-openai-authentication' for authentication configuration."
         (user-error "Please set your `agent-shell-openai-authentication'"))
       (agent-shell--make-acp-client :command (car agent-shell-openai-codex-acp-command)
                                     :command-params (cdr agent-shell-openai-codex-acp-command)
-                                    :environment-variables (append (list (format "CODEX_API_KEY=%s" codex-key))
+                                    :environment-variables (append (list (format "OPENAI_API_KEY=%s" codex-key))
                                                                    agent-shell-openai-codex-environment)
                                     :context-buffer buffer)))
    ((map-elt agent-shell-openai-authentication :login)
     (agent-shell--make-acp-client :command (car agent-shell-openai-codex-acp-command)
                                   :command-params (cdr agent-shell-openai-codex-acp-command)
-                                  :environment-variables (append '("OPENAI_API_KEY=")
-                                                                 agent-shell-openai-codex-environment)
+                                  :environment-variables agent-shell-openai-codex-environment
                                   :context-buffer buffer))
    (t
     (error "Invalid authentication configuration"))))
