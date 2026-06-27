@@ -648,6 +648,19 @@ and invoked with BUFFER as current."
              (list :sessionId (acp--get params 'sessionId)
                    :modelId (acp--get params 'modelId))
              (lambda (result) result)))
+      ("session/set_config_option"
+       (list "acp/setConfigOption"
+             (list :sessionId (acp--get params 'sessionId)
+                   :configId (acp--get params 'configId)
+                   :value (acp--get params 'value))
+             (lambda (result) result)))
+      ("session/fork"
+       ;; The proxy inherits the agent from the source session, so only the
+       ;; source sessionId and the forked session's cwd are needed.
+       (list "acp/forkSession"
+             (list :sessionId (acp--get params 'sessionId)
+                   :cwd (acp--get params 'cwd))
+             (lambda (result) result)))
       ("session/cancel"
        (list "acp/cancel"
              (list :sessionId (acp--get params 'sessionId)
@@ -1031,6 +1044,23 @@ When non-nil SYNC, send notification synchronously."
     (:params . ((sessionId . ,session-id)
                 (modelId . ,model-id)))))
 
+(cl-defun acp-make-session-set-config-option-request (&key session-id config-id value)
+  "Instantiate a \"session/set_config_option\" request.
+SESSION-ID is the ID of the session to change the config option for.
+CONFIG-ID is the id of the configuration option to change.
+VALUE is the new value, must correspond to one of the option's values.
+See https://agentclientprotocol.com/protocol/session-config-options"
+  (unless session-id
+    (error ":session-id is required"))
+  (unless config-id
+    (error ":config-id is required"))
+  (unless value
+    (error ":value is required"))
+  `((:method . "session/set_config_option")
+    (:params . ((sessionId . ,session-id)
+                (configId . ,config-id)
+                (value . ,value)))))
+
 (cl-defun acp-make-session-resume-request (&key session-id cwd mcp-servers)
   "Instantiate a \"session/resume\" request." 
   (unless session-id
@@ -1039,6 +1069,30 @@ When non-nil SYNC, send notification synchronously."
     (error ":cwd is required"))
   `((:method . "session/resume")
     (:params . ((sessionId . ,session-id)
+                (cwd . ,(directory-file-name (expand-file-name cwd)))
+                (mcpServers . ,(or mcp-servers []))))))
+
+(cl-defun acp-make-session-fork-request (&key session-id cwd mcp-servers)
+  "Instantiate a \"session/fork\" request.
+
+SESSION-ID is the ID of the session to fork from.
+CWD is the current working directory for the forked session.
+MCP-SERVERS is an optional list of MCP servers to use.
+
+This method forks an existing session, creating a new session that
+shares the conversation history of the original.  Only available if the
+agent advertises the `session.fork' capability.
+
+Note: This is an unstable ACP feature.
+
+See https://agentclientprotocol.com/rfds/session-fork."
+  (unless session-id
+    (error ":session-id is required"))
+  (unless cwd
+    (error ":cwd is required"))
+  `((:method . "session/fork")
+    (:params . ((sessionId . ,session-id)
+                ;; directory-file-name removes any trailing /
                 (cwd . ,(directory-file-name (expand-file-name cwd)))
                 (mcpServers . ,(or mcp-servers []))))))
 
