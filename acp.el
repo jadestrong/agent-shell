@@ -148,13 +148,6 @@ registered client so the proxy always receives a response."
   :type 'string
   :group 'acp)
 
-;; Optional explicit proxy config file. When nil, the proxy uses its default.
-(defcustom acp-proxy-config-file nil
-  "Explicit config file path for the ACP proxy, or nil to use the default."
-  :type '(choice (const :tag "Default config" nil)
-          (file :tag "Config file path"))
-  :group 'acp)
-
 ;; Timeout for long-running prompt requests (nil disables).
 (defcustom acp-prompt-timeout nil
   "Timeout in seconds for prompt requests, or nil to disable."
@@ -167,12 +160,6 @@ registered client so the proxy always receives a response."
 ;;   :type '(choice (const :tag "Stderr (default)" nil)
 ;;           (file :tag "Log file path"))
 ;;   :group 'acp)
-
-(defcustom acp-temp-dir
-  (expand-file-name "acp/" temporary-file-directory)
-  "Directory for generated proxy config files."
-  :type 'directory
-  :group 'acp)
 
 (defvar acp--log-file nil
   "Path to the current log file.")
@@ -193,13 +180,12 @@ registered client so the proxy always receives a response."
 (cl-defun acp-make-client (&key context-buffer command command-params environment-variables
                                 request-sender notification-sender request-resolver
                                 response-sender outgoing-request-decorator
-                                proxy-program proxy-config-file agent-name)
+                                proxy-program agent-name)
   "Create an ACP client compatible with acp.el.
 
 COMMAND and COMMAND-PARAMS are the ACP agent process to run via the proxy.
 ENVIRONMENT-VARIABLES is a list of strings in the form \"VAR=foo\".
 PROXY-PROGRAM overrides `acp-proxy-program'.
-PROXY-CONFIG-FILE uses an existing proxy config file.
 AGENT-NAME overrides the generated agent name.
 Other arguments match acp.el semantics."
   (unless (or command agent-name)
@@ -227,7 +213,6 @@ Other arguments match acp.el semantics."
         (cons :response-sender (or response-sender #'acp--response-sender))
         (cons :outgoing-request-decorator outgoing-request-decorator)
         (cons :proxy-program (or proxy-program acp-proxy-program))
-        (cons :proxy-config-file (or proxy-config-file acp-proxy-config-file))
         (cons :agent-name agent-name)
         (cons :proxy-connected nil)
         (cons :connect-result nil)
@@ -403,7 +388,6 @@ When SYNC is nil, invoke ON-SUCCESS/ON-FAILURE asynchronously."
            (random-num (random 100000))
            (filename (format "acp-%s-%05d.log" timestamp random-num))
            (proxy-program (map-elt client :proxy-program))
-           (proxy-config (map-elt client :proxy-config-file))
            (stderr-buffer (get-buffer-create "*acp-stderr(shared)*"))
            (stderr-proc (make-pipe-process
                          :name "acp-stderr(shared)"
@@ -420,8 +404,6 @@ When SYNC is nil, invoke ON-SUCCESS/ON-FAILURE asynchronously."
                                        (funcall handler std-error)))))))
       (setq acp--log-file (concat acp-log-file-directory filename))
       (let* ((proxy-args (append (list "--stdio" "--log-level" acp-log-level)
-                                 (when proxy-config
-                                   (list "--config" proxy-config))
                                  (list "--log-file" acp--log-file)))
              (conn (jsonrpc-process-connection
                     :name "acp-shared"
