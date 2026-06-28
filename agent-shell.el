@@ -344,11 +344,20 @@ Sources are checked in order until one returns non-nil."
 COMMAND, COMMAND-PARAMS, ENVIRONMENT-VARIABLES, and CONTEXT-BUFFER are
 passed through to `acp-make-client'."
   (let* ((full-command (append (list command) command-params))
-         (wrapped-command (agent-shell--build-command-for-execution full-command)))
+         (wrapped-command (agent-shell--build-command-for-execution full-command))
+         (agent-identifier (when context-buffer
+                             (map-nested-elt
+                              (buffer-local-value 'agent-shell--state context-buffer)
+                              '(:agent-config :identifier))))
+         (agent-name (cond
+                      ((stringp agent-identifier) agent-identifier)
+                      ((symbolp agent-identifier) (symbol-name agent-identifier))
+                      (t nil))))
     (acp-make-client :command (car wrapped-command)
                      :command-params (cdr wrapped-command)
                      :environment-variables environment-variables
                      :context-buffer context-buffer
+                     :agent-name agent-name
                      :outgoing-request-decorator (when context-buffer
                                                    (map-elt (buffer-local-value 'agent-shell--state context-buffer)
                                                             :outgoing-request-decorator)))))
@@ -1362,7 +1371,8 @@ See also `agent-shell-confirm-interrupt'."
             :client (map-elt (agent-shell--state) :client)
             :notification (acp-make-session-cancel-notification
                            :session-id (map-nested-elt (agent-shell--state) '(:session :id))
-                           :reason "User cancelled"))))
+                           :reason "User cancelled")))
+         (call-interactively #'shell-maker-interrupt))
         (t
          (agent-shell--shutdown)
          (call-interactively #'shell-maker-interrupt))))
@@ -1465,7 +1475,6 @@ Flow:
                 :response (agent-shell-viewport--response))))
            (when (agent-shell--initialize-client)
              (agent-shell--handle :command command :shell-buffer shell-buffer)))
-          ;; Needs ACP subscriptions
           ((or (not (map-nested-elt (agent-shell--state) '(:client :request-handlers)))
                (not (map-nested-elt (agent-shell--state) '(:client :notification-handlers)))
                (not (map-nested-elt (agent-shell--state) '(:client :error-handlers))))
@@ -1616,10 +1625,26 @@ COMMAND, when present, may be a shell command string or an argv vector."
   "Return non-nil if STATE has in-flight requests awaiting responses."
   (map-elt state :active-requests))
 
+(defun agent-shell--foreign-session-notification-p (state acp-notification)
+  "Return non-nil when ACP-NOTIFICATION belongs to a session other than STATE's.
+
+The shared proxy connection is multiplexed across buffers and routes by
+sessionId.  This guards against a notification ever being rendered in a
+buffer that does not own its session."
+  (when-let* ((notification-session (map-nested-elt acp-notification '(params sessionId)))
+              (own-session (map-nested-elt state '(:session :id))))
+    (not (equal notification-session own-session))))
+
 (cl-defun agent-shell--on-notification (&key state acp-notification)
   "Handle incoming ACP-NOTIFICATION using STATE."
   (map-put! state :last-activity-time (current-time))
-  (cond ((equal (map-elt acp-notification 'method) "session/update")
+  (cond ((agent-shell--foreign-session-notification-p state acp-notification)
+         ;; Defensive: never render another session's output in this buffer.
+         (when acp-logging-enabled
+           (message "agent-shell: dropped notification for session %s (buffer owns %s)"
+                    (map-nested-elt acp-notification '(params sessionId))
+                    (map-nested-elt state '(:session :id)))))
+        ((equal (map-elt acp-notification 'method) "session/update")
          (cond
           ;; Restore-summary mode: buffer chunks during session/load
           ;; and suppress normal rendering.  The summary fragments are
@@ -1854,13 +1879,20 @@ COMMAND, when present, may be a shell command string or an argv vector."
               :data (list (cons :tool-call-id (map-nested-elt acp-notification '(params update toolCallId)))
                           (cons :tool-call (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)))))))
              (let* ((diff (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)) :diff)))
+                    ;; Render from the persisted `:content' rather than this
+                    ;; notification's content.  Some agents stream the output
+                    ;; in an earlier `tool_call_update' and then send the
+                    ;; "completed" update with only `rawOutput' (no
+                    ;; `content'); `agent-shell--save-tool-call' preserves the
+                    ;; streamed content (it drops nil overrides), so reading
+                    ;; from state keeps the output visible on completion.
                     (output (concat
                              "\n\n"
                              ;; TODO: Consider if there are other
                              ;; types of content to display.
                              (mapconcat (lambda (item)
                                           (map-nested-elt item '(content text)))
-                                        (map-nested-elt acp-notification '(params update content))
+                                        (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)) :content))
                                         "\n\n")
                              "\n\n"))
                     (diff-text (agent-shell--format-diff-as-text diff))
@@ -1964,6 +1996,43 @@ COMMAND, when present, may be a shell command string or an argv vector."
             :create-new t
             :navigation 'never)
            (map-put! state :last-entry-type nil))))
+        ((equal (map-elt acp-notification 'method) "agent/ext-notification")
+         (let* ((orig-method (map-nested-elt acp-notification '(params method)))
+                (orig-params (map-nested-elt acp-notification '(params params))))
+           (cond
+            ((and orig-method
+                  (string-match-p "rate.limit\\|error/rate" orig-method))
+             (agent-shell--update-fragment
+              :state state
+              :block-id (format "%s-rate-limit" (map-elt state :request-count))
+              :body (or (map-elt orig-params 'message)
+                        "Rate limit exceeded. Please wait a moment before trying again.")
+              :create-new t)
+             (map-put! state :last-entry-type nil))
+            (acp-logging-enabled
+             (message "Agent ext notification: %s" orig-method)))))
+        ((equal (map-elt acp-notification 'method) "agent/disconnected")
+         (agent-shell-heartbeat-stop :heartbeat (map-elt state :heartbeat))
+         (let ((exit-code (map-nested-elt acp-notification '(params exitCode)))
+               (agent-name (map-nested-elt acp-notification '(params agentName))))
+           (agent-shell--update-fragment
+            :state state
+            :block-id (format "agent-disconnected-%s" (map-elt state :request-count))
+            :body (agent-shell--make-error-dialog-text
+                   :code exit-code
+                   :message (format "Agent '%s' disconnected (exit code: %s)"
+                                    (or agent-name "?")
+                                    (or exit-code "unknown")))
+            :create-new t)
+           (agent-shell--emit-event :event 'error
+                                    :data (list (cons :code exit-code)
+                                                (cons :message (format "Agent '%s' disconnected"
+                                                                       (or agent-name "?")))))
+           (shell-maker-finish-output :config shell-maker--config :success nil)))
+        ((equal (map-elt acp-notification 'method) "agent/stderr")
+         (let ((agent-name (map-nested-elt acp-notification '(params agentName)))
+               (line (map-nested-elt acp-notification '(params line))))
+           (message "[%s] %s" (or agent-name "agent") line)))
         (acp-logging-enabled
          (agent-shell--update-fragment
           :state state
@@ -4244,7 +4313,7 @@ through to `acp-send-request'."
                                        (map-elt state :active-requests)))
                  (when on-success
                    (funcall on-success acp-response)))
-   :on-failure (lambda (acp-error raw-message)
+   :on-failure (lambda (acp-error &optional raw-message)
                  (map-put! state :active-requests
                            (seq-remove (lambda (r)
                                          (equal r request))
@@ -4790,6 +4859,7 @@ Falls back to latest session in batch mode (e.g. tests)."
             :session (agent-shell--session-from-response
                       :acp-response acp-response
                       :acp-session-id acp-session-id))
+  (acp-set-session-id (map-elt agent-shell--state :client) acp-session-id)
   (agent-shell--save-config-options
    :state agent-shell--state
    :acp-config-options (map-elt acp-response 'configOptions)))
@@ -4852,6 +4922,8 @@ Falls back to latest session in batch mode (e.g. tests)."
                            :session (agent-shell--session-from-response
                                      :acp-response acp-response
                                      :acp-session-id (map-elt acp-response 'sessionId)))
+                 (acp-set-session-id (map-elt agent-shell--state :client)
+                                     (map-elt acp-response 'sessionId))
                  (agent-shell--save-config-options
                   :state agent-shell--state
                   :acp-config-options (map-elt acp-response 'configOptions))
@@ -5239,6 +5311,7 @@ Each entry is normalized via `agent-shell--make-mcp-server'."
   "Subscribe SHELL and STATE to ACP events."
   (acp-subscribe-to-errors
    :client (map-elt state :client)
+   :buffer (map-elt state :buffer)
    :on-error (lambda (acp-error)
                (if (agent-shell--active-requests-p state)
                    (agent-shell--update-fragment
@@ -5257,10 +5330,12 @@ Each entry is normalized via `agent-shell--make-mcp-server'."
                                 "Something is up ¯\\_ (ツ)_/¯"))))))
   (acp-subscribe-to-notifications
    :client (map-elt state :client)
+   :buffer (map-elt state :buffer)
    :on-notification (lambda (acp-notification)
                       (agent-shell--on-notification :state state :acp-notification acp-notification)))
   (acp-subscribe-to-requests
    :client (map-elt state :client)
+   :buffer (map-elt state :buffer)
    :on-request (lambda (acp-request)
                  (agent-shell--on-request :state state :acp-request acp-request))))
 
@@ -5578,7 +5653,7 @@ Each marked span is replaced by its `agent-shell-region-text' value."
                          (agent-shell-viewport--update-header)))
                      (when success
                        (agent-shell--process-pending-request))))
-     :on-failure (lambda (acp-error raw-message)
+     :on-failure (lambda (acp-error &optional raw-message)
                    ;; Display pending requests on failure.
                    (agent-shell--display-pending-requests)
                    (funcall (agent-shell--make-error-handler :state agent-shell--state :shell-buffer shell-buffer)
