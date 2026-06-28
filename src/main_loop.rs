@@ -1,7 +1,6 @@
 use anyhow::Result;
 
 use crate::application::Application;
-use crate::config::Config;
 use crate::connection::Connection;
 use crate::msg::Message;
 
@@ -11,11 +10,11 @@ use crate::msg::Message;
 /// (from the stdio Connection) into an async tokio mpsc channel, then
 /// hands control to `Application::run` which uses `tokio::select!` to
 /// multiplex Emacs messages and agent events.
-pub fn main_loop(connection: Connection, config: Config) -> Result<()> {
+pub fn main_loop(connection: Connection) -> Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     let local = tokio::task::LocalSet::new();
     local.block_on(&runtime, async {
-        let mut app = Application::new(config);
+        let mut app = Application::new();
         let (emacs_tx, mut emacs_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
 
         // Bridge the crossbeam receiver into the tokio channel.
