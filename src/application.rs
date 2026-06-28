@@ -7,10 +7,9 @@ use crossbeam_channel::Sender;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::agent::AgentConnection;
-use crate::config::Config;
 use agent_client_protocol as acp;
-use agent_client_protocol::{ConnectionTo, Responder, on_receive_notification, on_receive_request};
 use agent_client_protocol::role::acp::Agent;
+use agent_client_protocol::{on_receive_notification, on_receive_request, ConnectionTo, Responder};
 use agent_client_protocol_tokio::AcpAgent;
 
 use crate::msg::{
@@ -184,7 +183,6 @@ fn strip_ansi(s: &str) -> String {
 /// Core application state managing agents, sessions, and request routing.
 #[allow(dead_code)]
 pub struct Application {
-    config: Config,
     /// Connected ACP agents, keyed by agent name.
     agents: HashMap<String, AgentConnection>,
     /// Active sessions, keyed by session ID.
@@ -346,7 +344,10 @@ impl Application {
         let minute = (sod % 3_600) / 60;
         let second = sod % 60;
         let (year, month, day) = Self::civil_from_days(days);
-        format!("{:04}-{:02}-{:02}-{:02}-{:02}-{:02}", year, month, day, hour, minute, second)
+        format!(
+            "{:04}-{:02}-{:02}-{:02}-{:02}-{:02}",
+            year, month, day, hour, minute, second
+        )
     }
 
     fn session_transcript_file_path(cwd: &str, file_label: &str) -> PathBuf {
@@ -510,8 +511,12 @@ impl Application {
     }
 
     fn extract_tool_parameters(raw_input: Option<&serde_json::Value>) -> Option<String> {
-        let Some(raw_input) = raw_input else { return None };
-        let Some(obj) = raw_input.as_object() else { return None };
+        let Some(raw_input) = raw_input else {
+            return None;
+        };
+        let Some(obj) = raw_input.as_object() else {
+            return None;
+        };
         let excluded = ["command", "description", "plan"];
         let mut lines = Vec::new();
         for (k, v) in obj {
@@ -548,7 +553,11 @@ impl Application {
                 lines.push(format!("{}: {}", k, serialized));
             }
         }
-        if lines.is_empty() { None } else { Some(lines.join("\n")) }
+        if lines.is_empty() {
+            None
+        } else {
+            Some(lines.join("\n"))
+        }
     }
 
     fn make_tool_call_entry(
@@ -623,16 +632,16 @@ impl Application {
     }
 
     fn transcript_prompt_message(&mut self, session_id: &str, params: &serde_json::Value) {
-        let message = params.get("message").cloned().unwrap_or(serde_json::Value::Null);
+        let message = params
+            .get("message")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         let text = Self::extract_text_from_value(&message);
         self.start_transcript_section_if_needed(session_id, "user_prompt", "User");
         let body = if text.is_empty() {
             "_(empty prompt)_\n\n".to_string()
         } else {
-            format!(
-                "{}\n\n",
-                Self::indent_markdown_headers(text.trim())
-            )
+            format!("{}\n\n", Self::indent_markdown_headers(text.trim()))
         };
         self.append_session_transcript(session_id, &body);
     }
@@ -666,7 +675,11 @@ impl Application {
                 if text.is_empty() {
                     return;
                 }
-                self.start_transcript_section_if_needed(session_id, "agent_thought_chunk", "Agent's Thoughts");
+                self.start_transcript_section_if_needed(
+                    session_id,
+                    "agent_thought_chunk",
+                    "Agent's Thoughts",
+                );
                 let body = Self::indent_markdown_headers(text);
                 self.append_session_transcript(session_id, &body);
             }
@@ -680,10 +693,7 @@ impl Application {
                     return;
                 }
                 self.start_transcript_section_if_needed(session_id, "user_message_chunk", "User");
-                let body = format!(
-                    "> {}\n",
-                    Self::indent_markdown_headers(text)
-                );
+                let body = format!("> {}\n", Self::indent_markdown_headers(text));
                 self.append_session_transcript(session_id, &body);
             }
             "tool_call" | "tool_call_update" => {
@@ -695,8 +705,12 @@ impl Application {
                 let title = update.get("title").and_then(|v| v.as_str());
                 let kind = update.get("kind").and_then(|v| v.as_str());
                 let raw_input = update.get("rawInput");
-                let description = raw_input.and_then(|v| v.get("description")).and_then(|v| v.as_str());
-                let command = raw_input.and_then(|v| v.get("command")).and_then(|v| v.as_str());
+                let description = raw_input
+                    .and_then(|v| v.get("description"))
+                    .and_then(|v| v.as_str());
+                let command = raw_input
+                    .and_then(|v| v.get("command"))
+                    .and_then(|v| v.as_str());
 
                 let state = self
                     .session_transcript_state
@@ -704,7 +718,10 @@ impl Application {
                     .or_default();
                 state.last_entry_type = Some("tool_call".to_string());
                 if !tool_call_id.is_empty() {
-                    let snapshot = state.tool_calls.entry(tool_call_id.to_string()).or_default();
+                    let snapshot = state
+                        .tool_calls
+                        .entry(tool_call_id.to_string())
+                        .or_default();
                     if let Some(title) = title {
                         if !title.is_empty() {
                             snapshot.title = Some(title.to_string());
@@ -822,11 +839,10 @@ impl Application {
         tx
     }
 
-    pub fn new(config: Config) -> Self {
+    pub fn new() -> Self {
         let (agent_event_tx, agent_event_rx) = tokio::sync::mpsc::unbounded_channel();
         let backup_writer_tx = Self::spawn_backup_writer();
         Self {
-            config,
             agents: HashMap::new(),
             sessions: HashMap::new(),
             session_transcript_paths: HashMap::new(),
@@ -916,7 +932,11 @@ impl Application {
                 self.handle_request(req, emacs_sender).await?;
             }
             Message::Notification(notif) => {
-                tracing::info!("Received notification: {} params={}", notif.method, notif.params);
+                tracing::info!(
+                    "Received notification: {} params={}",
+                    notif.method,
+                    notif.params
+                );
                 self.handle_notification(notif)?;
             }
             Message::Response(resp) => {
@@ -1024,52 +1044,38 @@ impl Application {
             );
         }
 
-        // Look up agent config or build from request params.
-        let agent_config = match self.config.agents.get(&agent_name) {
-            Some(config) => config.clone(),
+        let command = match params.get("command").and_then(|v| v.as_str()) {
+            Some(cmd) => cmd.to_string(),
             None => {
-                let command = match params.get("command").and_then(|v| v.as_str()) {
-                    Some(cmd) => cmd.to_string(),
-                    None => {
-                        return Response::new_err(
-                            id,
-                            INVALID_PARAMS,
-                            format!("unknown agent: {} (missing command)", agent_name),
-                        );
-                    }
-                };
-                let args = params
-                    .get("args")
-                    .and_then(|v| v.as_array())
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let env = params.get("env").and_then(|v| v.as_object()).map(|obj| {
-                    obj.iter()
-                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                        .collect::<std::collections::HashMap<String, String>>()
-                });
-                let config = crate::config::AgentConfig {
-                    command,
-                    args,
-                    env,
-                    default_mode: None,
-                    default_model: None,
-                };
-                self.config.agents.insert(agent_name.clone(), config.clone());
-                config
+                return Response::new_err(
+                    id,
+                    INVALID_PARAMS,
+                    format!("unknown agent: {} (missing command)", agent_name),
+                );
             }
         };
+        let args = params
+            .get("args")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let env = params.get("env").and_then(|v| v.as_object()).map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect::<std::collections::HashMap<String, String>>()
+        });
 
         // Build AcpAgent: prepend NAME=value pairs so from_args parses them as env vars
-        let env_args = agent_config.env.as_ref().into_iter()
+        let env_args = env
+            .as_ref()
+            .into_iter()
             .flat_map(|env| env.iter().map(|(k, v)| format!("{}={}", k, v)));
-        let cmd_args = std::iter::once(agent_config.command.clone())
-            .chain(agent_config.args.iter().cloned());
+        let cmd_args = std::iter::once(command).chain(args);
         let all_args: Vec<String> = env_args.chain(cmd_args).collect();
         let acp_agent = match AcpAgent::from_args(all_args) {
             Ok(a) => a,
@@ -1103,10 +1109,7 @@ impl Application {
 
         // Oneshot to receive the connection handle and init result from the spawned task
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<
-            Result<
-                (ConnectionTo<Agent>, serde_json::Value, serde_json::Value),
-                String,
-            >,
+            Result<(ConnectionTo<Agent>, serde_json::Value, serde_json::Value), String>,
         >();
 
         tokio::task::spawn_local({
@@ -1123,21 +1126,17 @@ impl Application {
                                 match notif {
                                     acp::schema::AgentNotification::SessionNotification(sn) => {
                                         let session_id = sn.session_id.to_string();
-                                        let update = serde_json::to_value(&sn.update)
-                                            .unwrap_or_default();
-                                        let _ = event_tx.send(AgentEvent::SessionUpdate {
-                                            session_id,
-                                            update,
-                                        });
+                                        let update =
+                                            serde_json::to_value(&sn.update).unwrap_or_default();
+                                        let _ = event_tx
+                                            .send(AgentEvent::SessionUpdate { session_id, update });
                                     }
                                     acp::schema::AgentNotification::ExtNotification(en) => {
                                         let method = en.method.to_string();
                                         let params = serde_json::from_str(en.params.get())
                                             .unwrap_or_default();
-                                        let _ = event_tx.send(AgentEvent::ExtNotification {
-                                            method,
-                                            params,
-                                        });
+                                        let _ = event_tx
+                                            .send(AgentEvent::ExtNotification { method, params });
                                     }
                                     _ => {}
                                 }
@@ -1151,15 +1150,17 @@ impl Application {
                             let event_tx = event_tx.clone();
                             let agent_name = agent_name_task.clone();
                             async move |req: acp::schema::RequestPermissionRequest,
-                                        responder: Responder<acp::schema::RequestPermissionResponse>,
-                                        cx| {
+                                        responder: Responder<
+                                acp::schema::RequestPermissionResponse,
+                            >,
+                                        _cx| {
                                 let session_id = req.session_id.to_string();
                                 let request_id = req.tool_call.tool_call_id.to_string();
                                 let title = req.tool_call.fields.title.clone().unwrap_or_default();
-                                let tool_call = serde_json::to_value(&req.tool_call)
-                                    .unwrap_or_default();
-                                let options = serde_json::to_value(&req.options)
-                                    .unwrap_or_default();
+                                let tool_call =
+                                    serde_json::to_value(&req.tool_call).unwrap_or_default();
+                                let options =
+                                    serde_json::to_value(&req.options).unwrap_or_default();
                                 let _ = event_tx.send(AgentEvent::PermissionRequest {
                                     session_id,
                                     request_id,
@@ -1191,9 +1192,8 @@ impl Application {
                                         // Apply line/limit slicing
                                         if req.line.is_some() || req.limit.is_some() {
                                             let lines: Vec<&str> = content.lines().collect();
-                                            let start = req.line
-                                                .unwrap_or(1)
-                                                .saturating_sub(1) as usize;
+                                            let start =
+                                                req.line.unwrap_or(1).saturating_sub(1) as usize;
                                             let end = match req.limit {
                                                 Some(l) => (start + l as usize).min(lines.len()),
                                                 None => lines.len(),
@@ -1205,13 +1205,15 @@ impl Application {
                                             };
                                         }
                                         responder.respond(
-                                            acp::schema::ReadTextFileResponse::new(content)
+                                            acp::schema::ReadTextFileResponse::new(content),
                                         )?;
                                     }
                                     Err(e) => {
-                                        responder.respond_with_internal_error(
-                                            format!("failed to read {}: {}", path.display(), e)
-                                        )?;
+                                        responder.respond_with_internal_error(format!(
+                                            "failed to read {}: {}",
+                                            path.display(),
+                                            e
+                                        ))?;
                                     }
                                 }
                                 Ok(())
@@ -1241,13 +1243,15 @@ impl Application {
                                                 content,
                                             });
                                             responder.respond(
-                                                acp::schema::WriteTextFileResponse::new()
+                                                acp::schema::WriteTextFileResponse::new(),
                                             )?;
                                         }
                                         Err(e) => {
-                                            responder.respond_with_internal_error(
-                                                format!("failed to write {}: {}", path.display(), e)
-                                            )?;
+                                            responder.respond_with_internal_error(format!(
+                                                "failed to write {}: {}",
+                                                path.display(),
+                                                e
+                                            ))?;
                                         }
                                     }
                                     Ok(())
@@ -1260,8 +1264,11 @@ impl Application {
                     .connect_with(acp_agent, async move |cx: ConnectionTo<Agent>| {
                         tracing::info!("Spawned agent '{}'", agent_name_task);
                         // ACP initialize handshake
-                        let init = cx.send_request(
-                            acp::schema::InitializeRequest::new(acp::schema::ProtocolVersion::V1)
+                        let init = cx
+                            .send_request(
+                                acp::schema::InitializeRequest::new(
+                                    acp::schema::ProtocolVersion::V1,
+                                )
                                 .client_capabilities(
                                     acp::schema::ClientCapabilities::default()
                                         .fs(acp::schema::FileSystemCapabilities::default()
@@ -1269,19 +1276,17 @@ impl Application {
                                             .write_text_file(true))
                                         .terminal(true),
                                 )
-                                .client_info(acp::schema::Implementation::new(
-                                    "emacs-acp-proxy",
-                                    version,
-                                )),
-                        )
-                        .block_task()
-                        .await;
+                                .client_info(
+                                    acp::schema::Implementation::new("emacs-acp-proxy", version),
+                                ),
+                            )
+                            .block_task()
+                            .await;
 
                         match init {
                             Ok(resp) => {
-                                let capabilities =
-                                    serde_json::to_value(&resp.agent_capabilities)
-                                        .unwrap_or_default();
+                                let capabilities = serde_json::to_value(&resp.agent_capabilities)
+                                    .unwrap_or_default();
                                 let auth_methods =
                                     serde_json::to_value(&resp.auth_methods).unwrap_or_default();
                                 tracing::info!(
@@ -1289,7 +1294,9 @@ impl Application {
                                     agent_name_task,
                                     resp.auth_methods.len()
                                 );
-                                ready_tx.send(Ok((cx.clone(), capabilities, auth_methods))).ok();
+                                ready_tx
+                                    .send(Ok((cx.clone(), capabilities, auth_methods)))
+                                    .ok();
                             }
                             Err(e) => {
                                 ready_tx.send(Err(format!("initialize failed: {}", e))).ok();
@@ -1327,7 +1334,11 @@ impl Application {
             Ok(Ok((cx, capabilities, auth_methods))) => {
                 self.agents.insert(
                     agent_name,
-                    AgentConnection { connection: cx, capabilities: capabilities.clone(), auth_methods: auth_methods.clone() },
+                    AgentConnection {
+                        connection: cx,
+                        capabilities: capabilities.clone(),
+                        auth_methods: auth_methods.clone(),
+                    },
                 );
                 Response::new_ok(
                     id,
@@ -1494,7 +1505,9 @@ impl Application {
         };
 
         let content_blocks: Vec<acp::schema::ContentBlock> = if let Some(text) = message.as_str() {
-            vec![acp::schema::ContentBlock::Text(acp::schema::TextContent::new(text))]
+            vec![acp::schema::ContentBlock::Text(
+                acp::schema::TextContent::new(text),
+            )]
         } else {
             match serde_json::from_value(message) {
                 Ok(blocks) => blocks,
@@ -1613,7 +1626,7 @@ impl Application {
     }
 
     fn handle_list_agents(&self, id: crate::msg::RequestId) -> Response {
-        let mut agents: Vec<_> = self.config.agents.keys().cloned().collect();
+        let mut agents: Vec<_> = self.agents.keys().cloned().collect();
         agents.sort();
         Response::new_ok(id, serde_json::json!({ "agents": agents }))
     }
@@ -1830,11 +1843,7 @@ impl Application {
         let value = match params.get("value").and_then(|v| v.as_str()) {
             Some(val) => val.to_string(),
             None => {
-                return Response::new_err(
-                    id,
-                    INVALID_PARAMS,
-                    "missing or non-string value".into(),
-                );
+                return Response::new_err(id, INVALID_PARAMS, "missing or non-string value".into());
             }
         };
 
@@ -1867,8 +1876,11 @@ impl Application {
         let acp_session_id = acp::schema::SessionId::new(session_id.clone());
         let acp_config_id = acp::schema::SessionConfigId::new(config_id);
         let acp_value = acp::schema::SessionConfigValueId::new(value);
-        let request =
-            acp::schema::SetSessionConfigOptionRequest::new(acp_session_id, acp_config_id, acp_value);
+        let request = acp::schema::SetSessionConfigOptionRequest::new(
+            acp_session_id,
+            acp_config_id,
+            acp_value,
+        );
         match connection.send_request(request).block_task().await {
             Ok(resp) => match serde_json::to_value(&resp) {
                 Ok(val) => Response::new_ok(id, val),
@@ -1879,11 +1891,7 @@ impl Application {
                 ),
             },
             Err(e) => {
-                tracing::warn!(
-                    "set_config_option failed for session {}: {}",
-                    session_id,
-                    e
-                );
+                tracing::warn!("set_config_option failed for session {}: {}", session_id, e);
                 Response::new_err(
                     id,
                     INTERNAL_ERROR,
@@ -2136,24 +2144,20 @@ impl Application {
                     }),
                 }
             }
-            AgentEvent::ExtNotification { method, params } => {
-                Notification {
-                    method: notifications::AGENT_EXT_NOTIFICATION.into(),
-                    params: serde_json::json!({
-                        "method": method,
-                        "params": params,
-                    }),
-                }
-            }
-            AgentEvent::AgentStderr { agent_name, line } => {
-                Notification {
-                    method: notifications::AGENT_STDERR.into(),
-                    params: serde_json::json!({
-                        "agentName": agent_name,
-                        "line": line,
-                    }),
-                }
-            }
+            AgentEvent::ExtNotification { method, params } => Notification {
+                method: notifications::AGENT_EXT_NOTIFICATION.into(),
+                params: serde_json::json!({
+                    "method": method,
+                    "params": params,
+                }),
+            },
+            AgentEvent::AgentStderr { agent_name, line } => Notification {
+                method: notifications::AGENT_STDERR.into(),
+                params: serde_json::json!({
+                    "agentName": agent_name,
+                    "line": line,
+                }),
+            },
             AgentEvent::AgentExited {
                 agent_name,
                 exit_code,
@@ -2193,7 +2197,7 @@ mod tests {
     use crate::msg::RequestId;
 
     fn make_app() -> Application {
-        Application::new(Config::default())
+        Application::new()
     }
 
     fn make_sender() -> (Sender<Message>, crossbeam_channel::Receiver<Message>) {
@@ -2228,7 +2232,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_agents_returns_configured_agents() {
+    async fn list_agents_returns_connected_agents() {
         let mut app = make_app();
         let (tx, rx) = make_sender();
 
@@ -2244,12 +2248,7 @@ mod tests {
             Message::Response(resp) => {
                 assert!(resp.error.is_none(), "expected ok response");
                 let result = resp.result.unwrap();
-                assert!(result["agents"].is_array());
-                assert!(result["agents"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|a| a == "claude"));
+                assert_eq!(result["agents"], serde_json::json!([]));
             }
             other => panic!("expected Response, got {other:?}"),
         }
@@ -2351,10 +2350,9 @@ mod tests {
     }
 
     /// Build a `Responder<RequestPermissionResponse>` backed by a no-op sink, for use in tests.
-    async fn make_test_responder(
-    ) -> acp::Responder<acp::schema::RequestPermissionResponse> {
-        use agent_client_protocol::{ByteStreams, ConnectionTo, Handled, Responder as AcpResponder};
+    async fn make_test_responder() -> acp::Responder<acp::schema::RequestPermissionResponse> {
         use agent_client_protocol::role::UntypedRole;
+        use agent_client_protocol::{ByteStreams, ConnectionTo, Responder as AcpResponder};
         use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
         let (client_w, server_r) = tokio::io::duplex(4096);
@@ -2368,12 +2366,15 @@ mod tests {
         >();
 
         tokio::task::spawn_local(async move {
-            let _ = UntypedRole.builder()
+            let _ = UntypedRole
+                .builder()
                 .on_receive_request(
                     {
                         let mut tx = Some(responder_tx);
                         async move |_req: acp::schema::RequestPermissionRequest,
-                                    responder: AcpResponder<acp::schema::RequestPermissionResponse>,
+                                    responder: AcpResponder<
+                            acp::schema::RequestPermissionResponse,
+                        >,
                                     _cx| {
                             if let Some(tx) = tx.take() {
                                 let _ = tx.send(responder);
@@ -2389,11 +2390,15 @@ mod tests {
 
         // Client: send a dummy RequestPermissionRequest to trigger the server handler
         tokio::task::spawn_local(async move {
-            let _ = UntypedRole.builder()
+            let _ = UntypedRole
+                .builder()
                 .connect_with(client_transport, async |cx: ConnectionTo<UntypedRole>| {
                     let _ = cx.send_request(acp::schema::RequestPermissionRequest::new(
                         "sess-test",
-                        acp::schema::ToolCallUpdate::new("tc-test", acp::schema::ToolCallUpdateFields::new()),
+                        acp::schema::ToolCallUpdate::new(
+                            "tc-test",
+                            acp::schema::ToolCallUpdateFields::new(),
+                        ),
                         vec![],
                     ));
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2409,33 +2414,35 @@ mod tests {
     async fn agent_permission_request_sends_notification() {
         use tokio::task::LocalSet;
         let local = LocalSet::new();
-        local.run_until(async {
-            let mut app = make_app();
-            let (tx, rx) = make_sender();
+        local
+            .run_until(async {
+                let mut app = make_app();
+                let (tx, rx) = make_sender();
 
-            let responder = make_test_responder().await;
-            let event = AgentEvent::PermissionRequest {
-                session_id: "sess-1".into(),
-                request_id: "perm-1".into(),
-                permission_type: "file_write".into(),
-                title: "Write to foo.rs".into(),
-                tool_call: serde_json::json!({}),
-                options: serde_json::json!([]),
-                responder,
-                agent_name: "test-agent".into(),
-            };
-            app.handle_agent_event(event, &tx).await.unwrap();
+                let responder = make_test_responder().await;
+                let event = AgentEvent::PermissionRequest {
+                    session_id: "sess-1".into(),
+                    request_id: "perm-1".into(),
+                    permission_type: "file_write".into(),
+                    title: "Write to foo.rs".into(),
+                    tool_call: serde_json::json!({}),
+                    options: serde_json::json!([]),
+                    responder,
+                    agent_name: "test-agent".into(),
+                };
+                app.handle_agent_event(event, &tx).await.unwrap();
 
-            let msg = rx.recv().unwrap();
-            match msg {
-                Message::Notification(notif) => {
-                    assert_eq!(notif.method, notifications::PERMISSION_REQUEST);
-                    assert_eq!(notif.params["permissionType"], "file_write");
-                    assert_eq!(notif.params["title"], "Write to foo.rs");
+                let msg = rx.recv().unwrap();
+                match msg {
+                    Message::Notification(notif) => {
+                        assert_eq!(notif.method, notifications::PERMISSION_REQUEST);
+                        assert_eq!(notif.params["permissionType"], "file_write");
+                        assert_eq!(notif.params["title"], "Write to foo.rs");
+                    }
+                    other => panic!("expected Notification, got {other:?}"),
                 }
-                other => panic!("expected Notification, got {other:?}"),
-            }
-        }).await;
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -2563,48 +2570,41 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn connect_agent_spawn_failure_returns_error() {
-        use crate::config::AgentConfig;
         use tokio::task::LocalSet;
 
         let local = LocalSet::new();
-        local.run_until(async {
-            let mut config = Config::default();
-            config.agents.insert(
-                "bad-agent".into(),
-                AgentConfig {
-                    command: "/nonexistent/binary/path".into(),
-                    args: vec![],
-                    env: None,
-                    default_mode: None,
-                    default_model: None,
-                },
-            );
-            let mut app = Application::new(config);
-            let (tx, rx) = make_sender();
+        local
+            .run_until(async {
+                let mut app = Application::new();
+                let (tx, rx) = make_sender();
 
-            let req = Request {
-                id: RequestId::from(12i64),
-                method: methods::CONNECT_AGENT.into(),
-                params: serde_json::json!({"agentName": "bad-agent"}),
-            };
-            app.handle_request(req, &tx).await.unwrap();
+                let req = Request {
+                    id: RequestId::from(12i64),
+                    method: methods::CONNECT_AGENT.into(),
+                    params: serde_json::json!({
+                        "agentName": "bad-agent",
+                        "command": "/nonexistent/binary/path"
+                    }),
+                };
+                app.handle_request(req, &tx).await.unwrap();
 
-            let msg = rx.recv().unwrap();
-            match msg {
-                Message::Response(resp) => {
-                    let err = resp.error.unwrap();
-                    assert_eq!(err.code, INTERNAL_ERROR);
-                    assert!(
-                        err.message.contains("spawn failed")
-                            || err.message.contains("agent task dropped")
-                            || err.message.contains("No such file"),
-                        "unexpected error: {}",
-                        err.message
-                    );
+                let msg = rx.recv().unwrap();
+                match msg {
+                    Message::Response(resp) => {
+                        let err = resp.error.unwrap();
+                        assert_eq!(err.code, INTERNAL_ERROR);
+                        assert!(
+                            err.message.contains("spawn failed")
+                                || err.message.contains("agent task dropped")
+                                || err.message.contains("No such file"),
+                            "unexpected error: {}",
+                            err.message
+                        );
+                    }
+                    other => panic!("expected Response, got {other:?}"),
                 }
-                other => panic!("expected Response, got {other:?}"),
-            }
-        }).await;
+            })
+            .await;
     }
 
     // -- new_session handler ------------------------------------------------
@@ -3309,42 +3309,44 @@ mod tests {
     async fn respond_permission_returns_success() {
         use tokio::task::LocalSet;
         let local = LocalSet::new();
-        local.run_until(async {
-        let mut app = make_app();
-        let (tx, rx) = make_sender();
+        local
+            .run_until(async {
+                let mut app = make_app();
+                let (tx, rx) = make_sender();
 
-        let responder = make_test_responder().await;
-        app.pending_permissions.insert(
-            "perm-1".into(),
-            PendingPermissionRequest {
-                request_id: "perm-1".into(),
-                session_id: "sess-1".into(),
-                agent_name: "test-agent".into(),
-                responder,
-                created_at: std::time::Instant::now(),
-            },
-        );
+                let responder = make_test_responder().await;
+                app.pending_permissions.insert(
+                    "perm-1".into(),
+                    PendingPermissionRequest {
+                        request_id: "perm-1".into(),
+                        session_id: "sess-1".into(),
+                        agent_name: "test-agent".into(),
+                        responder,
+                        created_at: std::time::Instant::now(),
+                    },
+                );
 
-        let req = Request {
-            id: RequestId::from(90i64),
-            method: methods::RESPOND_PERMISSION.into(),
-            params: serde_json::json!({
-                "requestId": "perm-1",
-                "sessionId": "sess-1",
-                "optionId": "allow_once"
-            }),
-        };
-        app.handle_request(req, &tx).await.unwrap();
+                let req = Request {
+                    id: RequestId::from(90i64),
+                    method: methods::RESPOND_PERMISSION.into(),
+                    params: serde_json::json!({
+                        "requestId": "perm-1",
+                        "sessionId": "sess-1",
+                        "optionId": "allow_once"
+                    }),
+                };
+                app.handle_request(req, &tx).await.unwrap();
 
-        let msg = rx.recv().unwrap();
-        match msg {
-            Message::Response(resp) => {
-                assert!(resp.error.is_none());
-                assert!(resp.result.is_some());
-            }
-            other => panic!("expected Response, got {other:?}"),
-        }
-        }).await;
+                let msg = rx.recv().unwrap();
+                match msg {
+                    Message::Response(resp) => {
+                        assert!(resp.error.is_none());
+                        assert!(resp.result.is_some());
+                    }
+                    other => panic!("expected Response, got {other:?}"),
+                }
+            })
+            .await;
     }
 
     #[tokio::test]

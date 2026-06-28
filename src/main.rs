@@ -1,6 +1,5 @@
 pub mod agent;
 pub mod application;
-pub mod config;
 pub mod connection;
 pub mod main_loop;
 pub mod msg;
@@ -9,13 +8,11 @@ use std::path::{Path, PathBuf};
 use std::process;
 use tracing_subscriber::fmt::time;
 
-use config::Config;
 use connection::Connection;
 use tracing_subscriber::EnvFilter;
 
 struct CliArgs {
     stdio: bool,
-    config_path: Option<PathBuf>,
     log_level: Option<String>,
     log_file: Option<PathBuf>,
 }
@@ -23,7 +20,6 @@ struct CliArgs {
 fn parse_args() -> CliArgs {
     let mut args = CliArgs {
         stdio: false,
-        config_path: None,
         log_level: None,
         log_file: None,
     };
@@ -32,13 +28,6 @@ fn parse_args() -> CliArgs {
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--stdio" => args.stdio = true,
-            "--config" => {
-                args.config_path = iter.next().map(PathBuf::from);
-                if args.config_path.is_none() {
-                    eprintln!("error: --config requires a path argument");
-                    process::exit(1);
-                }
-            }
             "--log-level" => {
                 args.log_level = iter.next();
                 if args.log_level.is_none() {
@@ -107,29 +96,15 @@ fn main() {
         process::exit(1);
     }
 
-    // CLI --log-level takes precedence over config file, default is "info"
-    let log_level = cli
-        .log_level
-        .as_deref()
-        // .or(config.log_level.as_deref())
-        .unwrap_or("info");
+    let log_level = cli.log_level.as_deref().unwrap_or("info");
 
     init_tracing(log_level, cli.log_file.as_deref());
 
-    // Load config (before tracing init so we can read log_level from config)
-    let config = Config::load(cli.config_path.as_deref())
-        .unwrap_or_else(|e| {
-            eprintln!("warning: failed to load config: {e}, using defaults");
-            Config::default()
-        })
-        .merge_with_defaults();
-
     tracing::info!("emacs-acp-proxy starting");
-    tracing::info!("using config: {config:#?}");
 
     let (connection, io_threads) = Connection::stdio();
 
-    if let Err(e) = main_loop::main_loop(connection, config) {
+    if let Err(e) = main_loop::main_loop(connection) {
         tracing::error!("main loop error: {e:#}");
         process::exit(1);
     }
