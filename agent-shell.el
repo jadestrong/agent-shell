@@ -1213,6 +1213,7 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :pending-restore nil)
         (cons :prompt-capabilities nil)
         (cons :event-subscriptions nil)
+        (cons :active-message nil)
         (cons :idle-timer nil)
         (cons :sleep-token nil)
         (cons :active-requests nil)
@@ -1811,7 +1812,7 @@ viewport's compose buffer instead (carrying an unsent draft, or empty)."
    (t
     (user-error "Not in an agent-shell buffer"))))
 
-(cl-defun agent-shell--read-shell-buffer (&key prompt buffers force-short-names)
+(cl-defun agent-shell--read-shell-buffer (&key prompt buffers show-directory force-short-names)
   "Read an `agent-shell-mode' buffer via `completing-read'.
 Each candidate shows the agent icon, buffer name, status, and
 session title in aligned columns.
@@ -1825,6 +1826,9 @@ regardless of whether the candidates share an agent type).
 PROMPT is the prompt string (defaults to \"Agent shell buffer: \").
 BUFFERS is the list of buffers to choose from, defaulting to
 `agent-shell-buffers'.
+When SHOW-DIRECTORY is non-nil, insert an aligned column with each
+shell's working directory (its buffer-local `default-directory',
+abbreviated) between the status and the session title.
 
 Returns the chosen shell buffer.  Signals a `user-error' when no
 buffers are available or nothing was selected."
@@ -1848,6 +1852,7 @@ buffers are available or nothing was selected."
                                     (map-nested-elt agent-shell--state
                                                     '(:agent-config :buffer-name))))
                              (cons :status (symbol-name (agent-shell-status)))
+                             (cons :directory (abbreviate-file-name default-directory))
                              (cons :title (let ((title (string-trim
                                                         (car (split-string
                                                               (or (map-nested-elt agent-shell--state
@@ -1882,6 +1887,10 @@ buffers are available or nothing was selected."
          (status-width (apply #'max (mapcar (lambda (e)
                                               (length (map-elt e :status)))
                                             entries)))
+         (directory-width (if show-directory
+                              (apply #'max (mapcar (lambda (e) (length (map-elt e :directory)))
+                                                   entries))
+                            0))
          ;; Stash the icon as a text property so it can be supplied as an
          ;; affixation prefix later; this keeps the icon out of the candidate
          ;; text so `completing-read' matching doesn't see the leading space.
@@ -1898,6 +1907,10 @@ buffers are available or nothing was selected."
                                                              ("blocked" 'agent-shell-error)
                                                              (_ 'agent-shell-success)))
                                          (1+ status-width))
+                             (when show-directory
+                               (string-pad (propertize (map-elt e :directory)
+                                                       'face 'font-lock-comment-face)
+                                           (1+ directory-width)))
                              (propertize (map-elt e :title)
                                          'face 'agent-shell-session-title))
                             'agent-shell--icon (map-elt e :icon))
@@ -1938,7 +1951,8 @@ When `agent-shell-prefer-viewport-interaction' is non-nil and an
 associated viewport buffer exists, switch to that instead."
   (interactive)
   (let ((shell-buffer (agent-shell--read-shell-buffer
-                       :prompt "Switch to agent-shell buffer: ")))
+                       :prompt "Switch to agent-shell buffer: "
+                       :show-directory t)))
     (switch-to-buffer (or (when agent-shell-prefer-viewport-interaction
                             (agent-shell-viewport--buffer
                              :shell-buffer shell-buffer
@@ -4297,12 +4311,31 @@ For example, shut down ACP client."
                (file-directory-p agent-shell--pending-directory-cleanup))
       (delete-directory agent-shell--pending-directory-cleanup t t))))
 
+(defun agent-shell--hide-active-message ()
+  "Dismiss and forget the buffer's start-up \"Loading...\" indicator.
+
+Safe to call from any teardown path, including `kill-buffer-hook':
+errors are swallowed so they can never abort the caller."
+  (when-let* ((active-message (map-elt (agent-shell--state) :active-message)))
+    (ignore-errors
+      (agent-shell-active-message-hide :active-message active-message))
+    (map-put! (agent-shell--state) :active-message nil)))
+
 (defun agent-shell--shutdown ()
   "Shut down shell activity."
   (unless (derived-mode-p 'agent-shell-mode)
     (error "Not in a shell"))
+  ;; Dismiss the start-up indicator first so it is stopped even if the ACP
+  ;; teardown below signals an error.
+  (agent-shell--hide-active-message)
   (when (map-elt (agent-shell--state) :client)
-    (acp-shutdown :client (map-elt (agent-shell--state) :client))
+    ;; Never let a shutdown failure propagate: this runs from
+    ;; `kill-buffer-hook' (an error there aborts the buffer kill) and from
+    ;; `agent-shell-interrupt'.  Detaching this client does not disturb other
+    ;; shells sharing the proxy.
+    (condition-case err
+        (acp-shutdown :client (map-elt (agent-shell--state) :client))
+      (error (message "agent-shell: client shutdown errored: %S" err)))
     (map-put! (agent-shell--state) :client nil)
     (map-put! (agent-shell--state) :initialized nil)
     (map-put! (agent-shell--state) :authenticated nil)
@@ -4885,7 +4918,17 @@ variable (see makunbound)"))
          :event 'session-selection-cancelled
          :on-event (lambda (_event)
                      (kill-buffer shell-buffer)))
-        (let ((active-message (agent-shell-active-message-show :text "Loading...")))
+        (let ((active-message (agent-shell-active-message-show :text "Loading..." :buffer shell-buffer)))
+          ;; Track the indicator in state so teardown paths (interrupt,
+          ;; kill-buffer) can dismiss it even when the normal hide events
+          ;; never arrive (e.g. a start-up that hangs before session
+          ;; selection).  Add the key defensively for sessions created
+          ;; before it existed (mid-session package reload), otherwise
+          ;; `map-put!' cannot extend the alist in place.
+          (let ((state (agent-shell--state)))
+            (unless (assq :active-message state)
+              (nconc state (list (cons :active-message nil))))
+            (map-put! state :active-message active-message))
           (agent-shell-subscribe-to
            :shell-buffer shell-buffer
            :event 'session-prompt

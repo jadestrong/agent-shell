@@ -39,7 +39,7 @@
       (goto-char (point-max))
       (insert (format "%s %s %s\n" direction kind (map-elt message :json))))))
 
-(defconst acp-package-version "0.12.2")
+(defconst acp-package-version "0.13.1")
 (defconst acp--jsonrpc-version "2.0")
 (defconst acp-proxy-handles-transcripts t
   "Non-nil when transcripts are written by the ACP proxy.")
@@ -84,7 +84,7 @@ falling back to the session id stored in its context buffer."
     (cl-labels
         ((client-session-id (client)
            (or (map-elt client :session-id)
-               (when-let ((buf (map-elt client :context-buffer))
+               (when-let* ((buf (map-elt client :context-buffer))
                           ((buffer-live-p buf)))
                  (with-current-buffer buf
                    (when (and (boundp 'agent-shell--state)
@@ -394,7 +394,7 @@ When SYNC is nil, invoke ON-SUCCESS/ON-FAILURE asynchronously."
                          :buffer stderr-buffer
                          :filter (lambda (_process raw-output)
                                    (acp--log client "STDERR" "%s" (string-trim raw-output))
-                                   (when-let ((std-error (cond
+                                   (when-let* ((std-error (cond
                                                           ((acp--parse-stderr-api-error raw-output)
                                                            (acp--parse-stderr-api-error raw-output))
                                                           ((not (string-empty-p (string-trim raw-output)))
@@ -431,22 +431,50 @@ When SYNC is nil, invoke ON-SUCCESS/ON-FAILURE asynchronously."
         (map-put! client :process acp--shared-process)))))
 
 (defun acp--process-sentinel (client connection)
-  "Handle proxy process shutdown for CONNECTION." 
+  "Handle proxy process shutdown for CONNECTION.
+
+Notify every still-attached client of the disconnection so pending work
+fails loudly instead of hanging.  Without this, an in-flight startup
+request (e.g. connect) is never resolved when the proxy dies, leaving
+callers' progress indicators (such as agent-shell's \"Loading...\")
+spinning forever."
   (let* ((proc (jsonrpc--process connection))
-         (event (cond
-                 ((and proc (not (process-live-p proc)))
-                  (format "exited (%s)" (process-status proc)))
-                 (t "stopped"))))
+         (exited (and proc (not (process-live-p proc))))
+         (event (if exited
+                    (format "exited (%s)" (process-status proc))
+                  "stopped"))
+         ;; Snapshot attached clients before clearing shared state.  On a
+         ;; normal `acp-shutdown' the client has already been unregistered, so
+         ;; this list is empty and no disconnection is reported.
+         (clients acp--shared-client-list)
+         (exit-code (when exited (process-exit-status proc)))
+         (err `((code . -32603)
+                (message . ,(format "ACP proxy %s" event)))))
     (acp--log client "PROCESS" "%s" event)
     (setq acp--shared-connection nil)
     (setq acp--shared-process nil)
     (setq acp--shared-clients 0)
     (setq acp--shared-client-list nil)
+    ;; Always reset the sentinel's own client bookkeeping.
     (map-put! client :proxy-connected nil)
     (map-put! client :connect-state 'disconnected)
-    (map-put! client :connect-waiters ())
     (map-put! client :connection nil)
-    (map-put! client :process nil)))
+    (map-put! client :process nil)
+    (dolist (c clients)
+      (map-put! c :proxy-connected nil)
+      (map-put! c :connect-state 'disconnected)
+      (map-put! c :connection nil)
+      (map-put! c :process nil)
+      ;; Fail any pending connect so its on-failure runs.  This also clears
+      ;; the client's :connect-waiters.
+      (acp--drain-connect-waiters c :error err)
+      ;; Surface the disconnection to subscribers.  agent-shell reacts by
+      ;; showing an error and dismissing its "Loading..." indicator.
+      (acp--dispatch-notification
+       c "agent/disconnected"
+       (acp--normalize-object
+        `((agentName . ,(map-elt c :agent-name))
+          (exitCode . ,exit-code)))))))
 
 (cl-defun acp-shutdown (&key client)
   "Shutdown ACP CLIENT and release resources." 
@@ -696,8 +724,8 @@ When non-nil SYNC, send notification synchronously."
     (error ":client is required"))
   (unless request
     (error ":request is required"))
-  (when-let ((decorator (map-elt client :outgoing-request-decorator)))
-    (if-let ((decorated (funcall decorator request)))
+  (when-let* ((decorator (map-elt client :outgoing-request-decorator)))
+    (if-let* ((decorated (funcall decorator request)))
         (setq request decorated)
       (acp--log client "DECORATOR ERROR"
                 "Outgoing request decorator returned nil for \"%s\", sending original request"
@@ -945,7 +973,7 @@ When non-nil SYNC, send notification synchronously."
       (unless response
         (jsonrpc-error :code -32603
                        :message (format "No response for %s" method-name)))
-      (if-let ((err (acp--get response 'error)))
+      (if-let* ((err (acp--get response 'error)))
           (jsonrpc-error :code (or (acp--get err 'code) -32603)
                          :message (or (acp--get err 'message) "Internal error")
                          :data (acp--get err 'data))
