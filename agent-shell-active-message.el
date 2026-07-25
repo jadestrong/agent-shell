@@ -29,15 +29,28 @@
 (eval-when-compile
   (require 'cl-lib))
 
-(cl-defun agent-shell-active-message-show (&key text)
+(cl-defun agent-shell-active-message-show (&key text buffer)
   "Show a minibuffer active message displaying TEXT.
+
+When BUFFER is non-nil, the message auto-dismisses once BUFFER is no
+longer live, so the indicator can never outlive the work it tracks (for
+example, when a shell buffer is killed before its start-up completes).
 
 Returns an active message alist for use with
 `agent-shell-active-message-hide'."
   (let* ((reporter (make-progress-reporter (or text "Loading...")))
-         (timer (run-at-time 0 0.1
-                             (lambda ()
-                               (progress-reporter-update reporter)))))
+         (timer nil))
+    (setq timer
+          (run-at-time
+           0 0.1
+           (lambda ()
+             (if (and buffer (not (buffer-live-p buffer)))
+                 (progn
+                   (when (timerp timer)
+                     (cancel-timer timer))
+                   (progress-reporter-done reporter)
+                   (message nil))
+               (progress-reporter-update reporter)))))
     (list (cons :reporter reporter)
           (cons :timer timer))))
 
