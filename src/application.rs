@@ -28,6 +28,8 @@ pub mod methods {
     pub const CANCEL: &str = "acp/cancel";
     pub const LIST_AGENTS: &str = "acp/listAgents";
     pub const LIST_SESSIONS: &str = "acp/listSessions";
+    pub const LIST_PROJECT_SESSIONS: &str = "acp/listProjectSessions";
+    pub const RESUME_SESSION: &str = "acp/resumeSession";
     pub const AUTHENTICATE: &str = "acp/authenticate";
     pub const SET_MODEL: &str = "acp/setModel";
     pub const SET_MODE: &str = "acp/setMode";
@@ -400,11 +402,11 @@ impl Application {
     fn init_session_transcript(&mut self, session_id: &str, agent_name: &str, cwd: &str) {
         let file_label = Self::now_file_label();
         let path = Self::session_transcript_file_path(cwd, &file_label);
-        Self::ensure_gitignore(cwd);
+        // Self::ensure_gitignore(cwd);
         let ts = Self::now_label();
         let header = format!(
-            "# Agent Shell Transcript\n\n**Agent:** {}\n**Started:** {}\n**Working Directory:** {}\n\n---\n\n",
-            agent_name, ts, cwd
+            "# Agent Shell Transcript\n\n**Agent:** {}\n**Started:** {}\n**Working Directory:** {}\n**Session ID:** {}\n\n---\n\n",
+            agent_name, ts, cwd, session_id
         );
         self.session_transcript_paths
             .insert(session_id.to_string(), path.clone());
@@ -975,6 +977,13 @@ impl Application {
             methods::CANCEL => self.handle_cancel(req.id.clone(), req.params.clone()).await,
             methods::LIST_AGENTS => self.handle_list_agents(req.id.clone()),
             methods::LIST_SESSIONS => self.handle_list_sessions(req.id.clone()),
+            methods::LIST_PROJECT_SESSIONS => {
+                self.handle_list_project_sessions(req.id.clone(), req.params.clone())
+            }
+            methods::RESUME_SESSION => {
+                self.handle_resume_session(req.id.clone(), req.params.clone(), emacs_sender)
+                    .await
+            }
             methods::AUTHENTICATE => {
                 self.handle_authenticate(req.id.clone(), req.params.clone())
                     .await
@@ -1625,6 +1634,118 @@ impl Application {
         Response::new_ok(id, serde_json::json!({ "sessions": sessions }))
     }
 
+    /// Extracts one header field's value (e.g. `**Session ID:** abc` -> `abc`)
+    /// from a transcript header line, or `None` if the line doesn't match.
+    fn transcript_header_field<'a>(line: &'a str, label: &str) -> Option<&'a str> {
+        line.strip_prefix(label).map(str::trim)
+    }
+
+    /// Truncates TEXT to a short single-line preview, char-safe (so
+    /// multi-byte text like CJK isn't cut mid-character).
+    fn truncate_preview(text: &str) -> String {
+        const MAX_CHARS: usize = 80;
+        let mut result: String = text.chars().take(MAX_CHARS).collect();
+        if text.chars().count() > MAX_CHARS {
+            result.push('…');
+        }
+        result
+    }
+
+    /// Lists past sessions for a project by reading the transcript headers
+    /// this proxy has already written to `<cwd>/.agent-shell/transcripts/`.
+    ///
+    /// Unlike `handle_list_sessions` (in-memory, gone on restart), this reads
+    /// from disk so sessions survive proxy restarts. Returns sessions across
+    /// all agents that have ever run in this project — the caller decides
+    /// which agent to connect once a specific session is picked, rather than
+    /// having to pick an agent up front just to see what's resumable.
+    fn handle_list_project_sessions(
+        &self,
+        id: crate::msg::RequestId,
+        params: serde_json::Value,
+    ) -> Response {
+        let cwd = match params.get("cwd").and_then(|v| v.as_str()) {
+            Some(c) => c,
+            None => {
+                return Response::new_err(id, INVALID_PARAMS, "missing cwd".into());
+            }
+        };
+
+        let dir = PathBuf::from(cwd).join(".agent-shell").join("transcripts");
+        let mut sessions = Vec::new();
+
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+                let Ok(contents) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+
+                let mut agent_name = None;
+                let mut started_at = None;
+                let mut session_id = None;
+                let mut preview = None;
+                let mut past_header = false;
+                let mut awaiting_user_body = false;
+                for line in contents.lines() {
+                    if !past_header {
+                        if let Some(v) = Self::transcript_header_field(line, "**Agent:**") {
+                            agent_name = Some(v.to_string());
+                        } else if let Some(v) =
+                            Self::transcript_header_field(line, "**Started:**")
+                        {
+                            started_at = Some(v.to_string());
+                        } else if let Some(v) =
+                            Self::transcript_header_field(line, "**Session ID:**")
+                        {
+                            session_id = Some(v.to_string());
+                        } else if line.trim() == "---" {
+                            past_header = true;
+                        }
+                        continue;
+                    }
+                    // Once the header is behind us, grab the first line of
+                    // the first user prompt as a human-readable preview of
+                    // what this session was about (a bare session id tells
+                    // the user nothing when picking a session to resume).
+                    if awaiting_user_body {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            preview = Some(Self::truncate_preview(trimmed));
+                            break;
+                        }
+                    } else if line.trim_start().starts_with("## User") {
+                        awaiting_user_body = true;
+                    }
+                }
+
+                // Transcripts written before session ids were recorded can't
+                // be resumed by id, so they're not offered here.
+                if let Some(session_id) = session_id {
+                    sessions.push(serde_json::json!({
+                        "sessionId": session_id,
+                        "agentName": agent_name.unwrap_or_else(|| "Unknown Agent".to_string()),
+                        "startedAt": started_at.unwrap_or_default(),
+                        "preview": preview,
+                        "transcriptPath": path.to_string_lossy(),
+                    }));
+                }
+            }
+        }
+
+        sessions.sort_by(|a, b| {
+            b["startedAt"]
+                .as_str()
+                .unwrap_or_default()
+                .cmp(a["startedAt"].as_str().unwrap_or_default())
+        });
+
+        Response::new_ok(id, serde_json::json!({ "sessions": sessions }))
+    }
+
     fn handle_list_agents(&self, id: crate::msg::RequestId) -> Response {
         let mut agents: Vec<_> = self.agents.keys().cloned().collect();
         agents.sort();
@@ -2005,6 +2126,121 @@ impl Application {
                     e
                 );
                 Response::new_err(id, INTERNAL_ERROR, format!("fork_session failed: {}", e))
+            }
+        }
+    }
+
+    async fn handle_resume_session(
+        &mut self,
+        id: crate::msg::RequestId,
+        params: serde_json::Value,
+        emacs_sender: &Sender<Message>,
+    ) -> Response {
+        // Parse sessionId of the session to resume (required)
+        let session_id = match params.get("sessionId").and_then(|v| v.as_str()) {
+            Some(sid) => sid.to_string(),
+            None => {
+                return Response::new_err(id, INVALID_PARAMS, "missing sessionId".into());
+            }
+        };
+
+        // Parse agentName (required). Unlike fork, the session being resumed
+        // isn't necessarily tracked in `self.sessions` (it may be from a past
+        // proxy process), so the agent can't be inferred from a live session.
+        let agent_name = match params.get("agentName").and_then(|v| v.as_str()) {
+            Some(name) => name.to_string(),
+            None => {
+                return Response::new_err(id, INVALID_PARAMS, "missing agentName".into());
+            }
+        };
+
+        // Parse cwd for the resumed session (required)
+        let cwd = match params.get("cwd").and_then(|v| v.as_str()) {
+            Some(c) => c.to_string(),
+            None => {
+                return Response::new_err(id, INVALID_PARAMS, "missing cwd".into());
+            }
+        };
+
+        // Find the agent
+        let agent = match self.agents.get(&agent_name) {
+            Some(a) => a,
+            None => {
+                return Response::new_err(
+                    id,
+                    INTERNAL_ERROR,
+                    format!("agent not connected: {}", agent_name),
+                );
+            }
+        };
+
+        let supports_resume = agent
+            .capabilities
+            .get("sessionCapabilities")
+            .and_then(|c| c.get("resume"))
+            .is_some_and(|r| !r.is_null());
+        if !supports_resume {
+            return Response::new_err(
+                id,
+                INTERNAL_ERROR,
+                format!("agent '{}' does not support session/resume", agent_name),
+            );
+        }
+
+        let connection = agent.connection.clone();
+
+        // Forward resume request to the agent.
+        let acp_session_id = acp::schema::SessionId::new(session_id.clone());
+        let request = acp::schema::ResumeSessionRequest::new(acp_session_id, cwd.clone());
+        match connection.send_request(request).block_task().await {
+            Ok(resp) => {
+                // Register the resumed session under its agent.
+                self.sessions.insert(
+                    session_id.clone(),
+                    SessionState {
+                        id: session_id.clone(),
+                        agent_name: agent_name.clone(),
+                        status: SessionStatus::Active,
+                        message_state: SessionMessageState::default(),
+                    },
+                );
+                self.init_session_transcript(&session_id, &agent_name, &cwd);
+
+                // Build response mirroring acp/newSession.
+                let mut result = serde_json::json!({
+                    "sessionId": session_id,
+                });
+
+                if let Some(modes) = &resp.modes {
+                    result["modes"] = serde_json::to_value(modes).unwrap_or_default();
+                }
+
+                if let Some(models) = &resp.models {
+                    result["models"] = serde_json::to_value(models).unwrap_or_default();
+                }
+
+                if let Some(config_options) = &resp.config_options {
+                    result["configOptions"] =
+                        serde_json::to_value(config_options).unwrap_or_default();
+                }
+
+                Response::new_ok(id, result)
+            }
+            Err(e) => {
+                // Surface AuthRequired the same way new_session does.
+                if e.code == acp::schema::ErrorCode::AuthRequired.into() {
+                    let notif = Notification {
+                        method: notifications::AUTH_REQUIRED.into(),
+                        params: serde_json::json!({
+                            "agentName": agent_name,
+                            "message": e.message,
+                        }),
+                    };
+                    let _ = emacs_sender.send(Message::Notification(notif));
+                    return Response::new_err(id, AUTH_REQUIRED, e.message);
+                }
+                tracing::warn!("resume_session failed for session {}: {}", session_id, e);
+                Response::new_err(id, INTERNAL_ERROR, format!("resume_session failed: {}", e))
             }
         }
     }

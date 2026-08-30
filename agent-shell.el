@@ -1060,6 +1060,7 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :supports-session-fork nil)
         (cons :resume-session-id nil)
         (cons :fork-session-id nil)
+        (cons :project-resume-session-id nil)
         (cons :pending-restore nil)
         (cons :prompt-capabilities nil)
         (cons :event-subscriptions nil)
@@ -1439,6 +1440,32 @@ the session identified by SESSION-ID."
                                   (error "No agent config found"))
                       :session-id session-id
                       :new-session t))
+
+;;;###autoload
+(defun agent-shell-resume-project-session ()
+  "Browse this project's past sessions (across all agents) and resume one.
+
+Reads session history from `.agent-shell/transcripts/' (written by the
+proxy), so past sessions remain resumable even after restarting Emacs
+or the proxy process.
+
+Listing needs no agent connected at all (it's the proxy reading files
+off disk), so nothing is spawned just to browse; whichever agent the
+picked session actually belongs to is only connected once a session
+is chosen."
+  (interactive)
+  (acp-send-agentless-request
+   :client (agent-shell--make-agentless-client)
+   :request (acp-make-list-project-sessions-request
+             :cwd (agent-shell--resolve-path (agent-shell-cwd)))
+   :on-success (lambda (acp-response)
+                 (let ((sessions (append (or (map-elt acp-response 'sessions) '()) nil)))
+                   (condition-case nil
+                       (agent-shell--start-from-picked-project-session
+                        (agent-shell--prompt-select-project-session sessions))
+                     (quit nil))))
+   :on-failure (lambda (err)
+                 (message "Couldn't list project sessions: %s" (map-elt err 'message)))))
 
 ;;;###autoload
 (defun agent-shell-prompt-compose ()
@@ -4168,7 +4195,7 @@ FUNCTION should be a function accepting keyword arguments (&key ...)."
                    (list (car pair) (cdr pair)))
                  alist)))
 
-(cl-defun agent-shell--start (&key config no-focus new-session session-strategy session-id fork-session-id outgoing-request-decorator)
+(cl-defun agent-shell--start (&key config no-focus new-session session-strategy session-id fork-session-id project-resume-session-id outgoing-request-decorator)
   "Programmatically start shell with CONFIG.
 
 See `agent-shell-make-agent-config' for config format.
@@ -4178,6 +4205,10 @@ Set NEW-SESSION to start a separate new session.
 SESSION-STRATEGY overrides `agent-shell-session-strategy' buffer-locally.
 SESSION-ID resumes an existing session by its id string.
 FORK-SESSION-ID forks an existing session by its id string.
+PROJECT-RESUME-SESSION-ID resumes that project session id via
+`acp/resumeSession' once bootstrapped (see
+`agent-shell-resume-project-session', which resolves CONFIG to that
+session's own agent before calling this).
 OUTGOING-REQUEST-DECORATOR is passed through to `acp-make-client'."
   (unless (version<= "0.91.2" shell-maker-version)
     (error "Please update shell-maker to version 0.91.2 or newer"))
@@ -4288,6 +4319,8 @@ variable (see makunbound)"))
         (map-put! agent-shell--state :resume-session-id session-id))
       (when fork-session-id
         (map-put! agent-shell--state :fork-session-id fork-session-id))
+      (when project-resume-session-id
+        (map-put! agent-shell--state :project-resume-session-id project-resume-session-id))
       ;; Snapshot the strategy also in case it was dynamically re-bound
       (setq-local agent-shell-session-strategy
                   (or session-strategy agent-shell-session-strategy))
@@ -6033,51 +6066,59 @@ Must provide ON-SESSION-INIT (lambda ())."
      :block-id "starting"
      :body "\n\nCreating session..."
      :append t))
-  ;; User requested forking session with explicit session ID.
-  (if-let* ((fork-session-id (map-elt (agent-shell--state) :fork-session-id)))
-      (if (map-elt (agent-shell--state) :supports-session-fork)
-          (agent-shell--initiate-session-fork-by-id
-           :session-id fork-session-id
-           :shell-buffer shell-buffer
-           :on-session-init on-session-init)
-        ;; Forking not supported. Start a new session.
-        (message "Forking unsupported by agent. Starting new session.")
-        (agent-shell--emit-event :event 'session-selected)
-        (agent-shell--initiate-new-session
-         :shell-buffer shell-buffer
-         :on-session-init on-session-init))
-    ;; User requested resuming session with explicit session ID.
-    (if-let* ((resume-session-id (map-elt (agent-shell--state) :resume-session-id)))
-        (if (or (map-elt (agent-shell--state) :supports-session-load)
-                (map-elt (agent-shell--state) :supports-session-resume))
-            ;; Agent supports some form of resuming.
-            (progn
-              (agent-shell--emit-event
-               :event 'session-selected
-               :data (list (cons :session-id resume-session-id)))
-              (agent-shell--initiate-session-resume-by-id
-               :session-id resume-session-id
-               :shell-buffer shell-buffer
-               :on-session-init on-session-init))
-          ;; Resuming not supported. Start a new session.
-          (message "Resuming unsupported by agent. Starting new session.")
+  ;; User requested resuming a specific project session (already resolved to
+  ;; the right agent config by `agent-shell-resume-project-session').
+  (if-let* ((project-resume-session-id (map-elt (agent-shell--state) :project-resume-session-id)))
+      (agent-shell--resume-project-session
+       :session-id project-resume-session-id
+       :agent-name (agent-shell--agent-identifier-string)
+       :shell-buffer shell-buffer
+       :on-session-init on-session-init)
+    ;; User requested forking session with explicit session ID.
+    (if-let* ((fork-session-id (map-elt (agent-shell--state) :fork-session-id)))
+        (if (map-elt (agent-shell--state) :supports-session-fork)
+            (agent-shell--initiate-session-fork-by-id
+             :session-id fork-session-id
+             :shell-buffer shell-buffer
+             :on-session-init on-session-init)
+          ;; Forking not supported. Start a new session.
+          (message "Forking unsupported by agent. Starting new session.")
           (agent-shell--emit-event :event 'session-selected)
           (agent-shell--initiate-new-session
            :shell-buffer shell-buffer
            :on-session-init on-session-init))
-      ;; Resuming, but must request session list first.
-      (if (and (map-elt (agent-shell--state) :supports-session-list)
-               (or (map-elt (agent-shell--state) :supports-session-load)
-                   (map-elt (agent-shell--state) :supports-session-resume))
-               (not (memq agent-shell-session-strategy '(new-deferred new))))
-          (agent-shell--initiate-session-list-and-load
-           :shell-buffer shell-buffer
-           :on-session-init on-session-init)
-        (progn
-          (agent-shell--emit-event :event 'session-selected)
-          (agent-shell--initiate-new-session
-           :shell-buffer shell-buffer
-           :on-session-init on-session-init))))))
+      ;; User requested resuming session with explicit session ID.
+      (if-let* ((resume-session-id (map-elt (agent-shell--state) :resume-session-id)))
+          (if (or (map-elt (agent-shell--state) :supports-session-load)
+                  (map-elt (agent-shell--state) :supports-session-resume))
+              ;; Agent supports some form of resuming.
+              (progn
+                (agent-shell--emit-event
+                 :event 'session-selected
+                 :data (list (cons :session-id resume-session-id)))
+                (agent-shell--initiate-session-resume-by-id
+                 :session-id resume-session-id
+                 :shell-buffer shell-buffer
+                 :on-session-init on-session-init))
+            ;; Resuming not supported. Start a new session.
+            (message "Resuming unsupported by agent. Starting new session.")
+            (agent-shell--emit-event :event 'session-selected)
+            (agent-shell--initiate-new-session
+             :shell-buffer shell-buffer
+             :on-session-init on-session-init))
+        ;; Resuming, but must request session list first.
+        (if (and (map-elt (agent-shell--state) :supports-session-list)
+                 (or (map-elt (agent-shell--state) :supports-session-load)
+                     (map-elt (agent-shell--state) :supports-session-resume))
+                 (not (memq agent-shell-session-strategy '(new-deferred new))))
+            (agent-shell--initiate-session-list-and-load
+             :shell-buffer shell-buffer
+             :on-session-init on-session-init)
+          (progn
+            (agent-shell--emit-event :event 'session-selected)
+            (agent-shell--initiate-new-session
+             :shell-buffer shell-buffer
+             :on-session-init on-session-init)))))))
 
 (defun agent-shell--sort-sessions-by-recency (acp-sessions)
   "Return ACP-SESSIONS sorted by recency, newest first.
@@ -6831,6 +6872,113 @@ SESSION-TITLE is an optional display title for the resumed session."
                  (agent-shell--initiate-new-session
                   :shell-buffer shell-buffer
                   :on-session-init on-session-init))))
+
+(defun agent-shell--agent-identifier-string ()
+  "Return the current buffer's agent config identifier as a string."
+  (when-let* ((identifier (map-nested-elt (agent-shell--state) '(:agent-config :identifier))))
+    (if (symbolp identifier) (symbol-name identifier) identifier)))
+
+(defun agent-shell--project-session-choice-label (session)
+  "Format SESSION as a picker label: its agent, transcript filename, and a preview.
+
+The preview is the first line of the session's first user prompt (from
+`acp/listProjectSessions'), since a bare session id or timestamp alone
+doesn't say what a session was about.  SESSIONS can span multiple
+agents, so the agent name is shown too."
+  (format "%-12s %-24s %s"
+          (map-elt session 'agentName)
+          (file-name-nondirectory (or (map-elt session 'transcriptPath) ""))
+          (or (map-elt session 'preview) "(no messages yet)")))
+
+(defun agent-shell--prompt-select-project-session (sessions)
+  "Prompt to pick one of SESSIONS, as returned by `acp/listProjectSessions'.
+
+SESSIONS is already sorted newest first.  Return the picked session
+alist, or nil to start a new session instead."
+  (if (null sessions)
+      (progn (message "No project sessions found. Starting new session.") nil)
+    (let* ((new-session-choice "New session")
+           (choices (append (list (cons new-session-choice nil))
+                             (mapcar (lambda (session)
+                                       (cons (agent-shell--project-session-choice-label session)
+                                             session))
+                                     sessions)))
+           (selection (completing-read "Resume project session (default: New session): "
+                                       choices nil t nil nil new-session-choice)))
+      (map-elt choices selection))))
+
+(cl-defun agent-shell--resume-project-session (&key session-id agent-name shell-buffer on-session-init)
+  "Resume SESSION-ID for AGENT-NAME, finishing via SHELL-BUFFER/ON-SESSION-INIT."
+  (agent-shell--update-fragment
+   :state (agent-shell--state)
+   :namespace-id "bootstrapping"
+   :block-id "starting"
+   :body (format "\n\nResuming session %s..." session-id)
+   :append t)
+  (agent-shell--emit-event :event 'session-selected
+                           :data (list (cons :session-id session-id)))
+  (agent-shell--send-request
+   :state (agent-shell--state)
+   :client (map-elt (agent-shell--state) :client)
+   :request (acp-make-resume-project-session-request
+             :session-id session-id
+             :agent-name agent-name
+             :cwd (agent-shell--resolve-path (agent-shell-cwd)))
+   :buffer (current-buffer)
+   :on-success (lambda (acp-response)
+                 (agent-shell--set-session-from-response
+                  :acp-response acp-response
+                  :acp-session-id session-id)
+                 (agent-shell--update-fragment
+                  :state (agent-shell--state)
+                  :namespace-id "bootstrapping"
+                  :block-id "resumed_session"
+                  :label-left (format "%s %s"
+                                      (agent-shell--make-status-kind-label :status "completed")
+                                      (propertize "Resumed session" 'font-lock-face 'agent-shell-section-heading))
+                  :expanded t
+                  :body session-id)
+                 (agent-shell--finalize-session-init :on-session-init on-session-init))
+   :on-failure (lambda (acp-error &optional _raw-message)
+                 (message "Couldn't resume session: %s" (map-elt acp-error 'message))
+                 (agent-shell--update-fragment
+                  :state (agent-shell--state)
+                  :namespace-id "bootstrapping"
+                  :block-id "restore_fallback"
+                  :body (agent-shell--make-boxed-message
+                         :text "Warning: Could not resume session. Starting new"))
+                 (agent-shell--initiate-new-session
+                  :shell-buffer shell-buffer
+                  :on-session-init on-session-init))))
+
+(defun agent-shell--make-agentless-client ()
+  "Return a client good only for proxy methods that need no agent.
+
+`acp-make-client' requires either :command or :agent-name, but this
+client is only ever used with `acp-send-agentless-request', which
+never sends `acp/connectAgent' — so the name below is a placeholder,
+not a real agent."
+  (acp-make-client :agent-name "agent-shell/agentless"))
+
+(defun agent-shell--start-from-picked-project-session (picked)
+  "Start or resume based on PICKED session (or nil for a new session).
+
+PICKED is a session alist from `acp/listProjectSessions' (as chosen via
+`agent-shell--prompt-select-project-session'), or nil when the user
+chose to start a new session instead."
+  (if (null picked)
+      (agent-shell--start :config (or (agent-shell--auto-preferred-config)
+                                      (agent-shell-select-config
+                                       :prompt "Start with agent: ")
+                                      (error "No agent config found"))
+                          :new-session t)
+    (let* ((agent-name (map-elt picked 'agentName))
+           (config (agent-shell--resolve-config-designator (intern agent-name))))
+      (if config
+          (agent-shell--start :config config
+                              :new-session t
+                              :project-resume-session-id (map-elt picked 'sessionId))
+        (message "Agent '%s' is not configured; can't resume that session." agent-name)))))
 
 (defun agent-shell--eval-dynamic-values (obj)
   "Recursively evaluate any lambda values in OBJ.
