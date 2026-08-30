@@ -678,6 +678,12 @@ and invoked with BUFFER as current."
              (lambda (result) result)))
       ("session/list"
        (list "acp/listSessions" nil (lambda (result) result)))
+      ("session/resume_project"
+       (list "acp/resumeSession"
+             (list :sessionId (acp--get params 'sessionId)
+                   :agentName (acp--get params 'agentName)
+                   :cwd (acp--get params 'cwd))
+             (lambda (result) result)))
       (_
        (list nil nil nil)))))
 
@@ -717,6 +723,40 @@ When non-nil SYNC, send notification synchronously."
            :client client
            :notification notification
            :sync sync))
+
+(cl-defun acp-send-agentless-request (&key client request buffer on-success on-failure)
+  "Send REQUEST from CLIENT without connecting to any agent.
+
+Unlike `acp-send-request', this never calls `acp/connectAgent' — it
+only ensures the shared proxy process itself is running, then sends
+REQUEST's :method/:params to it as-is (skipping `acp--map-request').
+Only use this for proxy methods that don't need an agent connected
+(e.g. \"acp/listProjectSessions\"); anything else will be rejected by
+the proxy since no agent will ever be registered for CLIENT.
+
+ON-SUCCESS is of the form (lambda (response)).
+ON-FAILURE is of the form (lambda (error)).
+When BUFFER is provided, callbacks execute within buffer context."
+  (unless client
+    (error ":client is required"))
+  (unless request
+    (error ":request is required"))
+  (unless (acp--client-started-p client)
+    (acp--start-client :client client))
+  (acp--jsonrpc-request
+   client
+   (map-elt request :method)
+   (map-elt request :params)
+   (when on-success
+     (lambda (result)
+       (with-temp-buffer
+         (with-current-buffer (or buffer (map-elt client :context-buffer) (current-buffer))
+           (funcall on-success result)))))
+   (when on-failure
+     (lambda (err)
+       (with-temp-buffer
+         (with-current-buffer (or buffer (map-elt client :context-buffer) (current-buffer))
+           (funcall on-failure err)))))))
 
 (cl-defun acp--request-sender (&key client request buffer on-success on-failure sync)
   "Send REQUEST from CLIENT via proxy." 
@@ -1112,6 +1152,43 @@ See https://agentclientprotocol.com/rfds/session-fork."
     (error ":cwd is required"))
   `((:method . "session/list")
     (:params . ((cwd . ,(directory-file-name (expand-file-name cwd)))))))
+
+(cl-defun acp-make-list-project-sessions-request (&key cwd)
+  "Instantiate an \"acp/listProjectSessions\" request.
+
+Lists past sessions for CWD, across all agents that have run in this
+project, by reading the transcript files the proxy has already written
+under CWD's \".agent-shell/transcripts/\" directory.  Unlike
+`acp-make-session-list-request', this survives proxy restarts and
+doesn't need any agent connected.
+
+Note the :method here is already the proxy-native name (unlike every
+other `acp-make-*-request'): this request is only meant to be sent via
+`acp-send-agentless-request', which skips `acp--map-request' and
+`acp/connectAgent' entirely, since listing doesn't need an agent."
+  (unless cwd
+    (error ":cwd is required"))
+  `((:method . "acp/listProjectSessions")
+    (:params . ((cwd . ,(directory-file-name (expand-file-name cwd)))))))
+
+(cl-defun acp-make-resume-project-session-request (&key session-id agent-name cwd)
+  "Instantiate a \"session/resume_project\" request.
+
+SESSION-ID and AGENT-NAME identify the session to resume, as returned by
+`acp-make-list-project-sessions-request'.  CWD is the working directory
+for the resumed session.  Unlike `acp-make-list-project-sessions-request',
+send this via the regular `acp-send-request' once AGENT-NAME's agent is
+already connected — resuming does need that agent."
+  (unless session-id
+    (error ":session-id is required"))
+  (unless agent-name
+    (error ":agent-name is required"))
+  (unless cwd
+    (error ":cwd is required"))
+  `((:method . "session/resume_project")
+    (:params . ((sessionId . ,session-id)
+                (agentName . ,agent-name)
+                (cwd . ,(directory-file-name (expand-file-name cwd)))))))
 
 (cl-defun acp-make-session-load-request (&key session-id cwd mcp-servers)
   "Instantiate a \"session/load\" request." 
