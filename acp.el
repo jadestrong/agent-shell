@@ -680,13 +680,30 @@ and invoked with BUFFER as current."
              (lambda (result) result)))
       ("session/list"
        (list "acp/listSessions" nil (lambda (result) result)))
-      ("session/resume_project"
-       (list "acp/resumeSession"
-             (list :sessionId (acp--get params 'sessionId)
-                   :agentName (acp--get params 'agentName)
-                   :cwd (acp--get params 'cwd)
-                   :transcriptsDir (acp--get params 'transcriptsDir))
-             (lambda (result) result)))
+      ("session/resume"
+       ;; The proxy relays this to the connected agent's own session/resume
+       ;; (via SESSION-CAPABILITIES.resume); the client is already bound to
+       ;; one specific agent, so agentName comes from it, not from params.
+       (let ((agent-name (or (map-elt client :agent-name)
+                             (error ":agent-name is required"))))
+         (list "acp/resumeSession"
+               (list :sessionId (acp--get params 'sessionId)
+                     :agentName agent-name
+                     :cwd (acp--get params 'cwd)
+                     :transcriptsDir (acp--get params 'transcriptsDir))
+               (lambda (result) result))))
+      ("session/load"
+       ;; Same shape as session/resume, but replays prior history: any
+       ;; session/update notifications the agent sends while loading arrive
+       ;; through the normal notification channel, same as live prompting.
+       (let ((agent-name (or (map-elt client :agent-name)
+                             (error ":agent-name is required"))))
+         (list "acp/loadSession"
+               (list :sessionId (acp--get params 'sessionId)
+                     :agentName agent-name
+                     :cwd (acp--get params 'cwd)
+                     :transcriptsDir (acp--get params 'transcriptsDir))
+               (lambda (result) result))))
       (_
        (list nil nil nil)))))
 
@@ -1119,8 +1136,12 @@ See https://agentclientprotocol.com/protocol/session-config-options"
                 (configId . ,config-id)
                 (value . ,value)))))
 
-(cl-defun acp-make-session-resume-request (&key session-id cwd mcp-servers)
-  "Instantiate a \"session/resume\" request." 
+(cl-defun acp-make-session-resume-request (&key session-id cwd mcp-servers transcripts-dir)
+  "Instantiate a \"session/resume\" request.
+
+TRANSCRIPTS-DIR, when non-nil, is where the proxy should physically
+store this session's transcripts (see
+`agent-shell-transcript-central-directory')."
   (unless session-id
     (error ":session-id is required"))
   (unless cwd
@@ -1128,7 +1149,8 @@ See https://agentclientprotocol.com/protocol/session-config-options"
   `((:method . "session/resume")
     (:params . ((sessionId . ,session-id)
                 (cwd . ,(directory-file-name (expand-file-name cwd)))
-                (mcpServers . ,(or mcp-servers []))))))
+                (mcpServers . ,(or mcp-servers []))
+                ,@(when transcripts-dir `((transcriptsDir . ,transcripts-dir)))))))
 
 (cl-defun acp-make-session-fork-request (&key session-id cwd mcp-servers transcripts-dir)
   "Instantiate a \"session/fork\" request.
@@ -1183,31 +1205,12 @@ other `acp-make-*-request'): this request is only meant to be sent via
   `((:method . "acp/listProjectSessions")
     (:params . ((cwd . ,(directory-file-name (expand-file-name cwd)))))))
 
-(cl-defun acp-make-resume-project-session-request (&key session-id agent-name cwd transcripts-dir)
-  "Instantiate a \"session/resume_project\" request.
+(cl-defun acp-make-session-load-request (&key session-id cwd mcp-servers transcripts-dir)
+  "Instantiate a \"session/load\" request.
 
-SESSION-ID and AGENT-NAME identify the session to resume, as returned by
-`acp-make-list-project-sessions-request'.  CWD is the working directory
-for the resumed session.  TRANSCRIPTS-DIR, when non-nil, is where the
-proxy should physically store this session's transcripts (see
-`agent-shell-transcript-central-directory').  Unlike
-`acp-make-list-project-sessions-request', send this via the regular
-`acp-send-request' once AGENT-NAME's agent is already connected —
-resuming does need that agent."
-  (unless session-id
-    (error ":session-id is required"))
-  (unless agent-name
-    (error ":agent-name is required"))
-  (unless cwd
-    (error ":cwd is required"))
-  `((:method . "session/resume_project")
-    (:params . ((sessionId . ,session-id)
-                (agentName . ,agent-name)
-                (cwd . ,(directory-file-name (expand-file-name cwd)))
-                ,@(when transcripts-dir `((transcriptsDir . ,transcripts-dir)))))))
-
-(cl-defun acp-make-session-load-request (&key session-id cwd mcp-servers)
-  "Instantiate a \"session/load\" request." 
+TRANSCRIPTS-DIR, when non-nil, is where the proxy should physically
+store this session's transcripts (see
+`agent-shell-transcript-central-directory')."
   (unless session-id
     (error ":session-id is required"))
   (unless cwd
@@ -1215,7 +1218,8 @@ resuming does need that agent."
   `((:method . "session/load")
     (:params . ((sessionId . ,session-id)
                 (cwd . ,(directory-file-name (expand-file-name cwd)))
-                (mcpServers . ,(or mcp-servers []))))))
+                (mcpServers . ,(or mcp-servers []))
+                ,@(when transcripts-dir `((transcriptsDir . ,transcripts-dir)))))))
 
 (cl-defun acp-make-session-delete-request (&key session-id)
   "Instantiate a \"session/delete\" request." 

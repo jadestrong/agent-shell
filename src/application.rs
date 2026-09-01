@@ -30,6 +30,7 @@ pub mod methods {
     pub const LIST_SESSIONS: &str = "acp/listSessions";
     pub const LIST_PROJECT_SESSIONS: &str = "acp/listProjectSessions";
     pub const RESUME_SESSION: &str = "acp/resumeSession";
+    pub const LOAD_SESSION: &str = "acp/loadSession";
     pub const AUTHENTICATE: &str = "acp/authenticate";
     pub const SET_MODEL: &str = "acp/setModel";
     pub const SET_MODE: &str = "acp/setMode";
@@ -1054,6 +1055,10 @@ impl Application {
                 self.handle_resume_session(req.id.clone(), req.params.clone(), emacs_sender)
                     .await
             }
+            methods::LOAD_SESSION => {
+                self.handle_load_session(req.id.clone(), req.params.clone(), emacs_sender)
+                    .await
+            }
             methods::AUTHENTICATE => {
                 self.handle_authenticate(req.id.clone(), req.params.clone())
                     .await
@@ -1117,7 +1122,7 @@ impl Application {
             return Response::new_ok(
                 id,
                 serde_json::json!({
-                    "capabilities": existing.capabilities,
+                    "agentCapabilities": existing.capabilities,
                     "authMethods": existing.auth_methods,
                 }),
             );
@@ -1422,7 +1427,7 @@ impl Application {
                 Response::new_ok(
                     id,
                     serde_json::json!({
-                        "capabilities": capabilities,
+                        "agentCapabilities": capabilities,
                         "authMethods": auth_methods,
                     }),
                 )
@@ -2314,6 +2319,129 @@ impl Application {
                 }
                 tracing::warn!("resume_session failed for session {}: {}", session_id, e);
                 Response::new_err(id, INTERNAL_ERROR, format!("resume_session failed: {}", e))
+            }
+        }
+    }
+
+    async fn handle_load_session(
+        &mut self,
+        id: crate::msg::RequestId,
+        params: serde_json::Value,
+        emacs_sender: &Sender<Message>,
+    ) -> Response {
+        // Parse sessionId of the session to load (required)
+        let session_id = match params.get("sessionId").and_then(|v| v.as_str()) {
+            Some(sid) => sid.to_string(),
+            None => {
+                return Response::new_err(id, INVALID_PARAMS, "missing sessionId".into());
+            }
+        };
+
+        // Parse agentName (required). As with resume, the session being
+        // loaded isn't necessarily tracked in `self.sessions` (it may be
+        // from a past proxy process), so the agent can't be inferred from a
+        // live session.
+        let agent_name = match params.get("agentName").and_then(|v| v.as_str()) {
+            Some(name) => name.to_string(),
+            None => {
+                return Response::new_err(id, INVALID_PARAMS, "missing agentName".into());
+            }
+        };
+
+        // Parse cwd for the loaded session (required)
+        let cwd = match params.get("cwd").and_then(|v| v.as_str()) {
+            Some(c) => c.to_string(),
+            None => {
+                return Response::new_err(id, INVALID_PARAMS, "missing cwd".into());
+            }
+        };
+        let transcripts_dir = params.get("transcriptsDir").and_then(|v| v.as_str());
+
+        // Find the agent
+        let agent = match self.agents.get(&agent_name) {
+            Some(a) => a,
+            None => {
+                return Response::new_err(
+                    id,
+                    INTERNAL_ERROR,
+                    format!("agent not connected: {}", agent_name),
+                );
+            }
+        };
+
+        // Unlike resume/fork, `session/load' capability is a top-level
+        // AgentCapabilities field, not nested under sessionCapabilities.
+        let supports_load = agent
+            .capabilities
+            .get("loadSession")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !supports_load {
+            return Response::new_err(
+                id,
+                INTERNAL_ERROR,
+                format!("agent '{}' does not support session/load", agent_name),
+            );
+        }
+
+        let connection = agent.connection.clone();
+
+        // Forward load request to the agent. Any history replay arrives as
+        // ordinary session/update notifications via the connection-wide
+        // notification handler set up in handle_connect_agent, so it flows
+        // to Emacs (and gets written to the transcript) the same way live
+        // prompting does -- no extra relay needed here.
+        let acp_session_id = acp::schema::SessionId::new(session_id.clone());
+        let request = acp::schema::LoadSessionRequest::new(acp_session_id, cwd.clone());
+        match connection.send_request(request).block_task().await {
+            Ok(resp) => {
+                // Register the loaded session under its agent.
+                self.sessions.insert(
+                    session_id.clone(),
+                    SessionState {
+                        id: session_id.clone(),
+                        agent_name: agent_name.clone(),
+                        status: SessionStatus::Active,
+                        message_state: SessionMessageState::default(),
+                    },
+                );
+                self.init_session_transcript(&session_id, &agent_name, &cwd, transcripts_dir);
+
+                // Build response mirroring acp/newSession.
+                let mut result = serde_json::json!({
+                    "sessionId": session_id,
+                });
+
+                if let Some(modes) = &resp.modes {
+                    result["modes"] = serde_json::to_value(modes).unwrap_or_default();
+                }
+
+                if let Some(models) = &resp.models {
+                    result["models"] = serde_json::to_value(models).unwrap_or_default();
+                }
+
+                if let Some(config_options) = &resp.config_options {
+                    result["configOptions"] =
+                        serde_json::to_value(config_options).unwrap_or_default();
+                }
+
+                Response::new_ok(id, result)
+            }
+            Err(e) => {
+                // Surface AuthRequired the same way new_session does.
+                if e.code == acp::schema::ErrorCode::AuthRequired.into() {
+                    let notif = Notification {
+                        method: notifications::AUTH_REQUIRED.into(),
+                        params: serde_json::json!({
+                            "agentName": agent_name,
+                            "message": e.message,
+                        }),
+                    };
+                    let _ = emacs_sender.send(Message::Notification(notif));
+                    return Response::new_err(id, AUTH_REQUIRED, e.message);
+                }
+                tracing::warn!("load_session failed for session {}: {}", session_id, e);
+                Response::new_err(id, INTERNAL_ERROR, format!("load_session failed: {}", e))
             }
         }
     }
@@ -3754,5 +3882,103 @@ mod tests {
         assert!(!central_dir.exists());
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // -- session/load ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn load_session_missing_session_id_returns_invalid_params() {
+        let mut app = make_app();
+        let (tx, rx) = make_sender();
+
+        let req = Request {
+            id: RequestId::from(80i64),
+            method: methods::LOAD_SESSION.into(),
+            params: serde_json::json!({"agentName": "claude-code", "cwd": "/tmp"}),
+        };
+        app.handle_request(req, &tx).await.unwrap();
+
+        let msg = rx.recv().unwrap();
+        match msg {
+            Message::Response(resp) => {
+                let err = resp.error.unwrap();
+                assert_eq!(err.code, INVALID_PARAMS);
+                assert!(err.message.contains("missing sessionId"));
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn load_session_missing_agent_name_returns_invalid_params() {
+        let mut app = make_app();
+        let (tx, rx) = make_sender();
+
+        let req = Request {
+            id: RequestId::from(81i64),
+            method: methods::LOAD_SESSION.into(),
+            params: serde_json::json!({"sessionId": "sess-1", "cwd": "/tmp"}),
+        };
+        app.handle_request(req, &tx).await.unwrap();
+
+        let msg = rx.recv().unwrap();
+        match msg {
+            Message::Response(resp) => {
+                let err = resp.error.unwrap();
+                assert_eq!(err.code, INVALID_PARAMS);
+                assert!(err.message.contains("missing agentName"));
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn load_session_missing_cwd_returns_invalid_params() {
+        let mut app = make_app();
+        let (tx, rx) = make_sender();
+
+        let req = Request {
+            id: RequestId::from(82i64),
+            method: methods::LOAD_SESSION.into(),
+            params: serde_json::json!({"sessionId": "sess-1", "agentName": "claude-code"}),
+        };
+        app.handle_request(req, &tx).await.unwrap();
+
+        let msg = rx.recv().unwrap();
+        match msg {
+            Message::Response(resp) => {
+                let err = resp.error.unwrap();
+                assert_eq!(err.code, INVALID_PARAMS);
+                assert!(err.message.contains("missing cwd"));
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn load_session_agent_not_connected_returns_error() {
+        let mut app = make_app();
+        let (tx, rx) = make_sender();
+
+        let req = Request {
+            id: RequestId::from(83i64),
+            method: methods::LOAD_SESSION.into(),
+            params: serde_json::json!({
+                "sessionId": "sess-1",
+                "agentName": "claude-code",
+                "cwd": "/tmp"
+            }),
+        };
+        app.handle_request(req, &tx).await.unwrap();
+
+        let msg = rx.recv().unwrap();
+        match msg {
+            Message::Response(resp) => {
+                let err = resp.error.unwrap();
+                assert_eq!(err.code, INTERNAL_ERROR);
+                assert!(err.message.contains("agent not connected"));
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
     }
 }
