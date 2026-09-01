@@ -6442,7 +6442,8 @@ overwrites an existing fragment with equivalent content."
    :request (acp-make-session-new-request
              :cwd (agent-shell--resolve-path (agent-shell-cwd))
              :mcp-servers (agent-shell--mcp-servers)
-             :meta (map-nested-elt (agent-shell--state) '(:agent-config :session-meta)))
+             :meta (map-nested-elt (agent-shell--state) '(:agent-config :session-meta))
+             :transcripts-dir (agent-shell--transcript-central-directory-for (agent-shell-cwd)))
    :buffer (current-buffer)
    :on-success (lambda (acp-response)
                  (map-put! agent-shell--state
@@ -6727,7 +6728,7 @@ SESSION-TITLE is an optional display title for the resumed session."
              :session-id session-id
              :cwd (agent-shell--resolve-path (agent-shell-cwd))
              :mcp-servers (agent-shell--mcp-servers)
-             :meta (map-nested-elt (agent-shell--state) '(:agent-config :session-meta)))
+             :transcripts-dir (agent-shell--transcript-central-directory-for (agent-shell-cwd)))
    :buffer (current-buffer)
    :on-success (lambda (acp-fork-response)
                  (let ((new-session-id (map-elt acp-fork-response 'sessionId)))
@@ -6923,7 +6924,8 @@ alist, or nil to start a new session instead."
    :request (acp-make-resume-project-session-request
              :session-id session-id
              :agent-name agent-name
-             :cwd (agent-shell--resolve-path (agent-shell-cwd)))
+             :cwd (agent-shell--resolve-path (agent-shell-cwd))
+             :transcripts-dir (agent-shell--transcript-central-directory-for (agent-shell-cwd)))
    :buffer (current-buffer)
    :on-success (lambda (acp-response)
                  (agent-shell--set-session-from-response
@@ -9657,6 +9659,106 @@ For example:
       (error
        (message "Failed to generate transcript path: %S" err)
        nil))))
+
+(defcustom agent-shell-transcript-central-directory nil
+  "Directory under which ALL projects' transcripts are physically stored.
+
+Applies to transcripts written by the proxy (see
+`agent-shell-resume-project-session'), not the legacy
+`agent-shell-transcript-file-path-function' path above.
+
+When non-nil, new transcripts are written here instead of directly
+under each project's `.agent-shell/transcripts/', with a symlink left
+in its place so transcripts stay browsable/resumable from the project
+as usual.  This means history survives deleting or moving the project.
+
+Each project gets its own subdirectory here, named by
+`agent-shell-transcript-directory-name-function' applied to the
+project's absolute path — analogous to `auto-save-list-file-prefix'
+paired with `auto-save-file-name-transform'.
+
+nil (the default) keeps the per-project-only behavior."
+  :type '(choice (const :tag "Disabled (default)" nil) directory)
+  :group 'agent-shell)
+
+(defun agent-shell--default-transcript-directory-name (project-path)
+  "Encode PROJECT-PATH as a flat, unique directory name.
+
+Mirrors the convention Emacs already uses for centralized auto-save
+files: replace each path separator with \"!\"."
+  (string-replace "/" "!" (directory-file-name (expand-file-name project-path))))
+
+(defcustom agent-shell-transcript-directory-name-function
+  #'agent-shell--default-transcript-directory-name
+  "Function mapping a project's absolute path to a subdirectory name.
+
+Called with one argument (the project's absolute path); must return a
+filesystem-safe, unique directory name (not a full path) to nest under
+`agent-shell-transcript-central-directory'."
+  :type 'function
+  :group 'agent-shell)
+
+(defvar agent-shell--transcript-migration-decided (make-hash-table :test 'equal)
+  "Projects already asked about migrating local transcripts this session.
+
+Keyed by absolute project path, so
+`agent-shell--transcript-central-directory-for' only prompts once per
+project per Emacs session, regardless of how many sessions are
+started/resumed/forked in it afterwards.")
+
+(defun agent-shell--migrate-local-transcripts-to-central (local-dir central-dir)
+  "Move LOCAL-DIR's contents into CENTRAL-DIR, then symlink LOCAL-DIR to it.
+
+Errors if CENTRAL-DIR already exists and isn't empty, rather than
+risking a silent merge/clobber.  The symlink is created immediately
+(rather than left for the proxy to create on the next session), so
+LOCAL-DIR is never left simply missing if the session that triggered
+this migration goes on to fail for an unrelated reason."
+  (when (and (file-exists-p central-dir)
+             (directory-files central-dir nil directory-files-no-dot-files-regexp))
+    (user-error "Migration target %s already exists and isn't empty" central-dir))
+  (when (file-exists-p central-dir)
+    (delete-directory central-dir))
+  (make-directory (file-name-directory (directory-file-name central-dir)) t)
+  (rename-file local-dir central-dir)
+  (make-symbolic-link central-dir local-dir)
+  (message "Migrated transcripts from %s to %s" local-dir central-dir))
+
+(defun agent-shell--transcript-central-directory-for (project-path)
+  "Return the central transcripts dir for PROJECT-PATH, or nil if disabled.
+
+`agent-shell-transcript-central-directory' must be an absolute path —
+a relative one would otherwise silently resolve against whatever the
+current buffer's `default-directory' happens to be (typically the
+project itself), producing a different, wrong, nested location for
+every project instead of one stable central directory.
+
+If PROJECT-PATH already has local transcript history (a real,
+non-symlink `.agent-shell/transcripts/'), asks once per Emacs session
+via `y-or-n-p' whether to move it into the central directory now (see
+`agent-shell--migrate-local-transcripts-to-central').  Declining just
+means this project keeps writing locally, same as before this feature
+existed — nothing else to opt out of."
+  (when agent-shell-transcript-central-directory
+    (unless (file-name-absolute-p agent-shell-transcript-central-directory)
+      (user-error "agent-shell-transcript-central-directory must be an absolute path, got: %s"
+                  agent-shell-transcript-central-directory))
+    (let* ((project-path (expand-file-name project-path))
+           (central-root (expand-file-name agent-shell-transcript-central-directory))
+           (central-dir (expand-file-name
+                         (funcall agent-shell-transcript-directory-name-function project-path)
+                         central-root))
+           (local-dir (expand-file-name ".agent-shell/transcripts" project-path)))
+      (when (and (not (gethash project-path agent-shell--transcript-migration-decided))
+                 (file-directory-p local-dir)
+                 (not (file-symlink-p local-dir))
+                 (directory-files local-dir nil directory-files-no-dot-files-regexp))
+        (puthash project-path t agent-shell--transcript-migration-decided)
+        (when (y-or-n-p
+               (format "This project already has local transcript history in %s.  Migrate it into %s now? "
+                       local-dir central-dir))
+          (agent-shell--migrate-local-transcripts-to-central local-dir central-dir)))
+      central-dir)))
 
 (defun agent-shell--ensure-transcript-file ()
   "Ensure the transcript file exists, creating it with header if needed.

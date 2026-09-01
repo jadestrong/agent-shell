@@ -399,9 +399,79 @@ impl Application {
         }
     }
 
-    fn init_session_transcript(&mut self, session_id: &str, agent_name: &str, cwd: &str) {
+    /// Ensures `<cwd>/.agent-shell/transcripts` is a symlink into
+    /// `central_dir`, creating both as needed, and returns the directory
+    /// transcripts should actually be written to.
+    ///
+    /// If `<cwd>/.agent-shell/transcripts` already exists as a *real*
+    /// directory (pre-dating centralization, or from before this project
+    /// opted in), it's left untouched and returned as-is rather than risking
+    /// orphaning or clobbering existing history with an automatic migration.
+    fn ensure_transcripts_symlink(cwd: &str, central_dir: &str) -> PathBuf {
+        let real_dir = PathBuf::from(central_dir);
+        let agent_shell_dir = PathBuf::from(cwd).join(".agent-shell");
+        let link_path = agent_shell_dir.join("transcripts");
+
+        // Check the local side FIRST, before touching the central dir at
+        // all: if we're going to fall back to local storage anyway (a real
+        // directory already lives there), don't leave a stray empty
+        // subdirectory behind in `central_dir`.
+        if let Ok(meta) = std::fs::symlink_metadata(&link_path) {
+            if !meta.file_type().is_symlink() {
+                // A real directory already exists locally; don't touch it.
+                return link_path;
+            }
+            // Already a symlink; leave it (even if stale) rather than
+            // fighting whatever previously set it up, but still make sure
+            // its target exists.
+            if let Err(e) = std::fs::create_dir_all(&real_dir) {
+                tracing::warn!(
+                    "Failed to create central transcripts dir {:?}: {}",
+                    real_dir,
+                    e
+                );
+            }
+            return real_dir;
+        }
+
+        if let Err(e) = std::fs::create_dir_all(&real_dir) {
+            tracing::warn!(
+                "Failed to create central transcripts dir {:?}: {}",
+                real_dir,
+                e
+            );
+            return link_path;
+        }
+        if let Err(e) = std::fs::create_dir_all(&agent_shell_dir) {
+            tracing::warn!("Failed to create {:?}: {}", agent_shell_dir, e);
+            return link_path;
+        }
+        if let Err(e) = std::os::unix::fs::symlink(&real_dir, &link_path) {
+            tracing::warn!(
+                "Failed to symlink {:?} -> {:?}: {}",
+                link_path,
+                real_dir,
+                e
+            );
+            return link_path;
+        }
+        real_dir
+    }
+
+    fn init_session_transcript(
+        &mut self,
+        session_id: &str,
+        agent_name: &str,
+        cwd: &str,
+        transcripts_dir: Option<&str>,
+    ) {
         let file_label = Self::now_file_label();
-        let path = Self::session_transcript_file_path(cwd, &file_label);
+        let path = match transcripts_dir {
+            Some(central_dir) => {
+                Self::ensure_transcripts_symlink(cwd, central_dir).join(format!("{file_label}.md"))
+            }
+            None => Self::session_transcript_file_path(cwd, &file_label),
+        };
         // Self::ensure_gitignore(cwd);
         let ts = Self::now_label();
         let header = format!(
@@ -1378,6 +1448,7 @@ impl Application {
 
         // Parse cwd from params (optional, defaults to ".")
         let cwd = params.get("cwd").and_then(|v| v.as_str()).unwrap_or(".");
+        let transcripts_dir = params.get("transcriptsDir").and_then(|v| v.as_str());
 
         // Find the connected agent
         let agent = match self.agents.get(&agent_name) {
@@ -1412,7 +1483,7 @@ impl Application {
                         message_state: SessionMessageState::default(),
                     },
                 );
-                self.init_session_transcript(&session_id_str, &agent_name, cwd);
+                self.init_session_transcript(&session_id_str, &agent_name, cwd, transcripts_dir);
 
                 // Build response with session info
                 let mut result = serde_json::json!({
@@ -2043,6 +2114,7 @@ impl Application {
                 return Response::new_err(id, INVALID_PARAMS, "missing cwd".into());
             }
         };
+        let transcripts_dir = params.get("transcriptsDir").and_then(|v| v.as_str());
 
         // Find the source session to inherit its agent.
         let agent_name = match self.sessions.get(&source_session_id) {
@@ -2085,7 +2157,7 @@ impl Application {
                         message_state: SessionMessageState::default(),
                     },
                 );
-                self.init_session_transcript(&new_session_id, &agent_name, &cwd);
+                self.init_session_transcript(&new_session_id, &agent_name, &cwd, transcripts_dir);
 
                 // Build response mirroring acp/newSession.
                 let mut result = serde_json::json!({
@@ -2161,6 +2233,7 @@ impl Application {
                 return Response::new_err(id, INVALID_PARAMS, "missing cwd".into());
             }
         };
+        let transcripts_dir = params.get("transcriptsDir").and_then(|v| v.as_str());
 
         // Find the agent
         let agent = match self.agents.get(&agent_name) {
@@ -2204,7 +2277,7 @@ impl Application {
                         message_state: SessionMessageState::default(),
                     },
                 );
-                self.init_session_transcript(&session_id, &agent_name, &cwd);
+                self.init_session_transcript(&session_id, &agent_name, &cwd, transcripts_dir);
 
                 // Build response mirroring acp/newSession.
                 let mut result = serde_json::json!({
@@ -3607,5 +3680,79 @@ mod tests {
             }
             other => panic!("expected Response, got {other:?}"),
         }
+    }
+
+    // -- Centralized transcript storage --------------------------------------
+
+    fn make_test_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "agent-shell-test-{}-{}-{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn ensure_transcripts_symlink_creates_symlink_into_central_dir() {
+        let root = make_test_root("symlink");
+        let project_dir = root.join("project");
+        let central_dir = root.join("central");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let resolved = Application::ensure_transcripts_symlink(
+            project_dir.to_str().unwrap(),
+            central_dir.to_str().unwrap(),
+        );
+        assert_eq!(resolved, central_dir);
+
+        let link_path = project_dir.join(".agent-shell").join("transcripts");
+        let meta = std::fs::symlink_metadata(&link_path).unwrap();
+        assert!(meta.file_type().is_symlink());
+        assert_eq!(std::fs::read_link(&link_path).unwrap(), central_dir);
+
+        // Calling again is idempotent: still a symlink, same resolved dir.
+        let resolved_again = Application::ensure_transcripts_symlink(
+            project_dir.to_str().unwrap(),
+            central_dir.to_str().unwrap(),
+        );
+        assert_eq!(resolved_again, central_dir);
+        assert!(std::fs::symlink_metadata(&link_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn ensure_transcripts_symlink_leaves_existing_real_directory_untouched() {
+        let root = make_test_root("real-dir");
+        let project_dir = root.join("project");
+        let central_dir = root.join("central");
+        let link_path = project_dir.join(".agent-shell").join("transcripts");
+        std::fs::create_dir_all(&link_path).unwrap();
+        std::fs::write(link_path.join("existing.md"), "pre-existing history").unwrap();
+
+        let resolved = Application::ensure_transcripts_symlink(
+            project_dir.to_str().unwrap(),
+            central_dir.to_str().unwrap(),
+        );
+        assert_eq!(resolved, link_path);
+
+        let meta = std::fs::symlink_metadata(&link_path).unwrap();
+        assert!(!meta.file_type().is_symlink());
+        assert!(link_path.join("existing.md").exists());
+
+        // Falling back to local storage shouldn't leave a stray empty
+        // subdirectory behind in the central dir.
+        assert!(!central_dir.exists());
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

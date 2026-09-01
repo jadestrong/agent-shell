@@ -638,7 +638,8 @@ and invoked with BUFFER as current."
                (list :agentName agent-name
                      :cwd cwd
                      :mcpServers (or (acp--get params 'mcpServers) [])
-                     :_meta (acp--get params '_meta))
+                     :_meta (acp--get params '_meta)
+                     :transcriptsDir (acp--get params 'transcriptsDir))
                (lambda (result) result))))
       ("session/prompt"
        (let ((session-id (acp--get params 'sessionId))
@@ -669,7 +670,8 @@ and invoked with BUFFER as current."
        ;; source sessionId and the forked session's cwd are needed.
        (list "acp/forkSession"
              (list :sessionId (acp--get params 'sessionId)
-                   :cwd (acp--get params 'cwd))
+                   :cwd (acp--get params 'cwd)
+                   :transcriptsDir (acp--get params 'transcriptsDir))
              (lambda (result) result)))
       ("session/cancel"
        (list "acp/cancel"
@@ -682,7 +684,8 @@ and invoked with BUFFER as current."
        (list "acp/resumeSession"
              (list :sessionId (acp--get params 'sessionId)
                    :agentName (acp--get params 'agentName)
-                   :cwd (acp--get params 'cwd))
+                   :cwd (acp--get params 'cwd)
+                   :transcriptsDir (acp--get params 'transcriptsDir))
              (lambda (result) result)))
       (_
        (list nil nil nil)))))
@@ -1055,14 +1058,19 @@ When BUFFER is provided, callbacks execute within buffer context."
                         (when meta
                           `((_meta . ,meta)))))))
 
-(cl-defun acp-make-session-new-request (&key cwd mcp-servers meta)
-  "Instantiate a \"session/new\" request." 
+(cl-defun acp-make-session-new-request (&key cwd mcp-servers meta transcripts-dir)
+  "Instantiate a \"session/new\" request.
+
+TRANSCRIPTS-DIR, when non-nil, is where the proxy should physically
+store this session's transcripts (see
+`agent-shell-transcript-central-directory')."
   (unless cwd
     (error ":cwd is required"))
   `((:method . "session/new")
     (:params . ((cwd . ,(directory-file-name (expand-file-name cwd)))
                 (mcpServers . ,(or mcp-servers []))
-                ,@(when meta `((_meta . ,meta)))))))
+                ,@(when meta `((_meta . ,meta)))
+                ,@(when transcripts-dir `((transcriptsDir . ,transcripts-dir)))))))
 
 (cl-defun acp-make-session-prompt-request (&key session-id prompt)
   "Instantiate a \"session/prompt\" request." 
@@ -1122,12 +1130,15 @@ See https://agentclientprotocol.com/protocol/session-config-options"
                 (cwd . ,(directory-file-name (expand-file-name cwd)))
                 (mcpServers . ,(or mcp-servers []))))))
 
-(cl-defun acp-make-session-fork-request (&key session-id cwd mcp-servers)
+(cl-defun acp-make-session-fork-request (&key session-id cwd mcp-servers transcripts-dir)
   "Instantiate a \"session/fork\" request.
 
 SESSION-ID is the ID of the session to fork from.
 CWD is the current working directory for the forked session.
 MCP-SERVERS is an optional list of MCP servers to use.
+TRANSCRIPTS-DIR, when non-nil, is where the proxy should physically
+store the forked session's transcripts (see
+`agent-shell-transcript-central-directory').
 
 This method forks an existing session, creating a new session that
 shares the conversation history of the original.  Only available if the
@@ -1144,7 +1155,8 @@ See https://agentclientprotocol.com/rfds/session-fork."
     (:params . ((sessionId . ,session-id)
                 ;; directory-file-name removes any trailing /
                 (cwd . ,(directory-file-name (expand-file-name cwd)))
-                (mcpServers . ,(or mcp-servers []))))))
+                (mcpServers . ,(or mcp-servers []))
+                ,@(when transcripts-dir `((transcriptsDir . ,transcripts-dir)))))))
 
 (cl-defun acp-make-session-list-request (&key cwd)
   "Instantiate a \"session/list\" request." 
@@ -1171,14 +1183,17 @@ other `acp-make-*-request'): this request is only meant to be sent via
   `((:method . "acp/listProjectSessions")
     (:params . ((cwd . ,(directory-file-name (expand-file-name cwd)))))))
 
-(cl-defun acp-make-resume-project-session-request (&key session-id agent-name cwd)
+(cl-defun acp-make-resume-project-session-request (&key session-id agent-name cwd transcripts-dir)
   "Instantiate a \"session/resume_project\" request.
 
 SESSION-ID and AGENT-NAME identify the session to resume, as returned by
 `acp-make-list-project-sessions-request'.  CWD is the working directory
-for the resumed session.  Unlike `acp-make-list-project-sessions-request',
-send this via the regular `acp-send-request' once AGENT-NAME's agent is
-already connected — resuming does need that agent."
+for the resumed session.  TRANSCRIPTS-DIR, when non-nil, is where the
+proxy should physically store this session's transcripts (see
+`agent-shell-transcript-central-directory').  Unlike
+`acp-make-list-project-sessions-request', send this via the regular
+`acp-send-request' once AGENT-NAME's agent is already connected —
+resuming does need that agent."
   (unless session-id
     (error ":session-id is required"))
   (unless agent-name
@@ -1188,7 +1203,8 @@ already connected — resuming does need that agent."
   `((:method . "session/resume_project")
     (:params . ((sessionId . ,session-id)
                 (agentName . ,agent-name)
-                (cwd . ,(directory-file-name (expand-file-name cwd)))))))
+                (cwd . ,(directory-file-name (expand-file-name cwd)))
+                ,@(when transcripts-dir `((transcriptsDir . ,transcripts-dir)))))))
 
 (cl-defun acp-make-session-load-request (&key session-id cwd mcp-servers)
   "Instantiate a \"session/load\" request." 
