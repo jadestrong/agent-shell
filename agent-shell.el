@@ -440,11 +440,20 @@ Sources are checked in order until one returns non-nil."
 COMMAND, COMMAND-PARAMS, ENVIRONMENT-VARIABLES, and CONTEXT-BUFFER are
 passed through to `acp-make-client'."
   (let* ((full-command (append (list command) command-params))
-         (wrapped-command (agent-shell--build-command-for-execution full-command)))
+         (wrapped-command (agent-shell--build-command-for-execution full-command))
+         (agent-identifier (when context-buffer
+                             (map-nested-elt
+                              (buffer-local-value 'agent-shell--state context-buffer)
+                              '(:agent-config :identifier))))
+         (agent-name (cond
+                      ((stringp agent-identifier) agent-identifier)
+                      ((symbolp agent-identifier) (symbol-name agent-identifier))
+                      (t nil))))
     (acp-make-client :command (car wrapped-command)
                      :command-params (cdr wrapped-command)
                      :environment-variables environment-variables
                      :context-buffer context-buffer
+                     :agent-name agent-name
                      :outgoing-request-decorator (when context-buffer
                                                    (map-elt (buffer-local-value 'agent-shell--state context-buffer)
                                                             :outgoing-request-decorator)))))
@@ -1204,6 +1213,7 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :pending-restore nil)
         (cons :prompt-capabilities nil)
         (cons :event-subscriptions nil)
+        (cons :active-message nil)
         (cons :idle-timer nil)
         (cons :sleep-token nil)
         (cons :active-requests nil)
@@ -1599,6 +1609,32 @@ the session identified by SESSION-ID."
                       :new-session t))
 
 ;;;###autoload
+(defun agent-shell-resume-project-session ()
+  "Browse this project's past sessions (across all agents) and resume one.
+
+Reads session history from `.agent-shell/transcripts/' (written by the
+proxy), so past sessions remain resumable even after restarting Emacs
+or the proxy process.
+
+Listing needs no agent connected at all (it's the proxy reading files
+off disk), so nothing is spawned just to browse; whichever agent the
+picked session actually belongs to is only connected once a session
+is chosen."
+  (interactive)
+  (acp-send-agentless-request
+   :client (agent-shell--make-agentless-client)
+   :request (acp-make-list-project-sessions-request
+             :cwd (agent-shell--resolve-path (agent-shell-cwd)))
+   :on-success (lambda (acp-response)
+                 (let ((sessions (append (or (map-elt acp-response 'sessions) '()) nil)))
+                   (condition-case nil
+                       (agent-shell--start-from-picked-project-session
+                        (agent-shell--prompt-select-project-session sessions))
+                     (quit nil))))
+   :on-failure (lambda (err)
+                 (message "Couldn't list project sessions: %s" (map-elt err 'message)))))
+
+;;;###autoload
 (defun agent-shell-prompt-compose ()
   "Compose an `agent-shell' prompt in a dedicated buffer.
 
@@ -1802,7 +1838,7 @@ viewport's compose buffer instead (carrying an unsent draft, or empty)."
    (t
     (user-error "Not in an agent-shell buffer"))))
 
-(cl-defun agent-shell--read-shell-buffer (&key prompt buffers force-short-names)
+(cl-defun agent-shell--read-shell-buffer (&key prompt buffers show-directory force-short-names)
   "Read an `agent-shell-mode' buffer via `completing-read'.
 Each candidate shows the agent icon, buffer name, status, and
 session title in aligned columns.
@@ -1816,6 +1852,9 @@ regardless of whether the candidates share an agent type).
 PROMPT is the prompt string (defaults to \"Agent shell buffer: \").
 BUFFERS is the list of buffers to choose from, defaulting to
 `agent-shell-buffers'.
+When SHOW-DIRECTORY is non-nil, insert an aligned column with each
+shell's working directory (its buffer-local `default-directory',
+abbreviated) between the status and the session title.
 
 Returns the chosen shell buffer.  Signals a `user-error' when no
 buffers are available or nothing was selected."
@@ -1839,6 +1878,7 @@ buffers are available or nothing was selected."
                                     (map-nested-elt agent-shell--state
                                                     '(:agent-config :buffer-name))))
                              (cons :status (symbol-name (agent-shell-status)))
+                             (cons :directory (abbreviate-file-name default-directory))
                              (cons :title (let ((title (string-trim
                                                         (car (split-string
                                                               (or (map-nested-elt agent-shell--state
@@ -1873,6 +1913,10 @@ buffers are available or nothing was selected."
          (status-width (apply #'max (mapcar (lambda (e)
                                               (length (map-elt e :status)))
                                             entries)))
+         (directory-width (if show-directory
+                              (apply #'max (mapcar (lambda (e) (length (map-elt e :directory)))
+                                                   entries))
+                            0))
          ;; Stash the icon as a text property so it can be supplied as an
          ;; affixation prefix later; this keeps the icon out of the candidate
          ;; text so `completing-read' matching doesn't see the leading space.
@@ -1889,6 +1933,10 @@ buffers are available or nothing was selected."
                                                              ("blocked" 'agent-shell-error)
                                                              (_ 'agent-shell-success)))
                                          (1+ status-width))
+                             (when show-directory
+                               (string-pad (propertize (map-elt e :directory)
+                                                       'face 'font-lock-comment-face)
+                                           (1+ directory-width)))
                              (propertize (map-elt e :title)
                                          'face 'agent-shell-session-title))
                             'agent-shell--icon (map-elt e :icon))
@@ -1929,7 +1977,8 @@ When `agent-shell-prefer-viewport-interaction' is non-nil and an
 associated viewport buffer exists, switch to that instead."
   (interactive)
   (let ((shell-buffer (agent-shell--read-shell-buffer
-                       :prompt "Switch to agent-shell buffer: ")))
+                       :prompt "Switch to agent-shell buffer: "
+                       :show-directory t)))
     (switch-to-buffer (or (when agent-shell-prefer-viewport-interaction
                             (agent-shell-viewport--buffer
                              :shell-buffer shell-buffer
@@ -2177,7 +2226,8 @@ See also `agent-shell-confirm-interrupt'."
             :client (map-elt (agent-shell--state) :client)
             :notification (acp-make-session-cancel-notification
                            :session-id (map-nested-elt (agent-shell--state) '(:session :id))
-                           :reason "User cancelled"))))
+                           :reason "User cancelled")))
+         (call-interactively #'shell-maker-interrupt))
         (t
          (agent-shell--shutdown)
          (call-interactively #'shell-maker-interrupt))))
@@ -2352,7 +2402,6 @@ Flow:
                 :response (agent-shell-viewport--response))))
            (when (agent-shell--initialize-client)
              (agent-shell--handle :command command :shell-buffer shell-buffer)))
-          ;; Needs ACP subscriptions
           ((or (not (map-nested-elt (agent-shell--state) '(:client :request-handlers)))
                (not (map-nested-elt (agent-shell--state) '(:client :notification-handlers)))
                (not (map-nested-elt (agent-shell--state) '(:client :error-handlers))))
@@ -2911,6 +2960,15 @@ No-op while that function has nothing to summarize (an empty group)."
      :block-id group-id
      :label-left label
      :above-last-prompt (not (agent-shell--active-requests-p state)))))
+(defun agent-shell--foreign-session-notification-p (state acp-notification)
+  "Return non-nil when ACP-NOTIFICATION belongs to a session other than STATE's.
+
+The shared proxy connection is multiplexed across buffers and routes by
+sessionId.  This guards against a notification ever being rendered in a
+buffer that does not own its session."
+  (when-let* ((notification-session (map-nested-elt acp-notification '(params sessionId)))
+              (own-session (map-nested-elt state '(:session :id))))
+    (not (equal notification-session own-session))))
 
 (cl-defun agent-shell--sync-activity-group-fold (&key state group-id namespace-id)
   "Leave GROUP-ID the only expanded activity group in STATE.
@@ -2948,7 +3006,13 @@ Clears STATE's `:expanded-activity-group'."
 (cl-defun agent-shell--on-notification (&key state acp-notification)
   "Handle incoming ACP-NOTIFICATION using STATE."
   (map-put! state :last-activity-time (current-time))
-  (cond ((equal (map-elt acp-notification 'method) "session/update")
+  (cond ((agent-shell--foreign-session-notification-p state acp-notification)
+         ;; Defensive: never render another session's output in this buffer.
+         (when acp-logging-enabled
+           (message "agent-shell: dropped notification for session %s (buffer owns %s)"
+                    (map-nested-elt acp-notification '(params sessionId))
+                    (map-nested-elt state '(:session :id)))))
+        ((equal (map-elt acp-notification 'method) "session/update")
          ;; Replayed user_message_chunks aren't followed by
          ;; shell-maker's end-of-prompt marker (no real
          ;; `comint-send-input').  Insert it on the first
@@ -3269,14 +3333,29 @@ Clears STATE's `:expanded-activity-group'."
               :above-last-prompt (not (agent-shell--active-requests-p state))))
            (agent-shell--cancel-idle-timer)
            (agent-shell--emit-event
-            :event 'tool-call-update
+           :event 'tool-call-update
             :data (list (cons :tool-call-id (map-nested-elt acp-notification '(params update toolCallId)))
                         (cons :tool-call (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)))))))
            (let* ((diffs (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)) :diffs)))
+                  ;; Render from the persisted `:content' rather than this
+                  ;; notification's content.  Some agents stream the output
+                  ;; in an earlier `tool_call_update' and then send the
+                  ;; "completed" update with only `rawOutput' (no
+                  ;; `content'); `agent-shell--save-tool-call' preserves the
+                  ;; streamed content (it drops nil overrides), so reading
+                  ;; from state keeps the output visible on completion.
                   (output (concat
                            "\n\n"
-                           (agent-shell--tool-call-update-output-markdown
-                            (map-nested-elt acp-notification '(params update)))
+                           (if-let* ((persisted-content
+                                      (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)) :content))))
+                               (mapconcat #'agent-shell--content-block-to-markdown
+                                          (seq-keep (lambda (item) (map-elt item 'content)) persisted-content)
+                                          "\n\n")
+                             ;; No persisted content yet (e.g. first update
+                             ;; for this tool call) -- fall back to the
+                             ;; notification's own content/rawOutput.
+                             (agent-shell--tool-call-update-output-markdown
+                              (map-nested-elt acp-notification '(params update))))
                            "\n\n"))
                   (diff-text (agent-shell--format-diffs-as-text diffs))
                   (body-text (if diff-text
@@ -3418,6 +3497,43 @@ Clears STATE's `:expanded-activity-group'."
             :append t
             :above-last-prompt (not (shell-maker-busy)))
            (map-put! state :last-entry-type nil))))
+        ((equal (map-elt acp-notification 'method) "agent/ext-notification")
+         (let* ((orig-method (map-nested-elt acp-notification '(params method)))
+                (orig-params (map-nested-elt acp-notification '(params params))))
+           (cond
+            ((and orig-method
+                  (string-match-p "rate.limit\\|error/rate" orig-method))
+             (agent-shell--update-fragment
+              :state state
+              :block-id (format "%s-rate-limit" (map-elt state :request-count))
+              :body (or (map-elt orig-params 'message)
+                        "Rate limit exceeded. Please wait a moment before trying again.")
+              :create-new t)
+             (map-put! state :last-entry-type nil))
+            (acp-logging-enabled
+             (message "Agent ext notification: %s" orig-method)))))
+        ((equal (map-elt acp-notification 'method) "agent/disconnected")
+         (agent-shell-heartbeat-stop :heartbeat (map-elt state :heartbeat))
+         (let ((exit-code (map-nested-elt acp-notification '(params exitCode)))
+               (agent-name (map-nested-elt acp-notification '(params agentName))))
+           (agent-shell--update-fragment
+            :state state
+            :block-id (format "agent-disconnected-%s" (map-elt state :request-count))
+            :body (agent-shell--make-error-dialog-text
+                   :code exit-code
+                   :message (format "Agent '%s' disconnected (exit code: %s)"
+                                    (or agent-name "?")
+                                    (or exit-code "unknown")))
+            :create-new t)
+           (agent-shell--emit-event :event 'error
+                                    :data (list (cons :code exit-code)
+                                                (cons :message (format "Agent '%s' disconnected"
+                                                                       (or agent-name "?")))))
+           (shell-maker-finish-output :config shell-maker--config :success nil)))
+        ((equal (map-elt acp-notification 'method) "agent/stderr")
+         (let ((agent-name (map-nested-elt acp-notification '(params agentName)))
+               (line (map-nested-elt acp-notification '(params line))))
+           (message "[%s] %s" (or agent-name "agent") line)))
         (acp-logging-enabled
          (agent-shell--update-fragment
           :state state
@@ -4221,12 +4337,31 @@ For example, shut down ACP client."
                (file-directory-p agent-shell--pending-directory-cleanup))
       (delete-directory agent-shell--pending-directory-cleanup t t))))
 
+(defun agent-shell--hide-active-message ()
+  "Dismiss and forget the buffer's start-up \"Loading...\" indicator.
+
+Safe to call from any teardown path, including `kill-buffer-hook':
+errors are swallowed so they can never abort the caller."
+  (when-let* ((active-message (map-elt (agent-shell--state) :active-message)))
+    (ignore-errors
+      (agent-shell-active-message-hide :active-message active-message))
+    (map-put! (agent-shell--state) :active-message nil)))
+
 (defun agent-shell--shutdown ()
   "Shut down shell activity."
   (unless (derived-mode-p 'agent-shell-mode)
     (error "Not in a shell"))
+  ;; Dismiss the start-up indicator first so it is stopped even if the ACP
+  ;; teardown below signals an error.
+  (agent-shell--hide-active-message)
   (when (map-elt (agent-shell--state) :client)
-    (acp-shutdown :client (map-elt (agent-shell--state) :client))
+    ;; Never let a shutdown failure propagate: this runs from
+    ;; `kill-buffer-hook' (an error there aborts the buffer kill) and from
+    ;; `agent-shell-interrupt'.  Detaching this client does not disturb other
+    ;; shells sharing the proxy.
+    (condition-case err
+        (acp-shutdown :client (map-elt (agent-shell--state) :client))
+      (error (message "agent-shell: client shutdown errored: %S" err)))
     (map-put! (agent-shell--state) :client nil)
     (map-put! (agent-shell--state) :initialized nil)
     (map-put! (agent-shell--state) :authenticated nil)
@@ -4624,7 +4759,11 @@ See `agent-shell-make-agent-config' for config format.
 Set NO-FOCUS to start in background.
 Set NEW-SESSION to start a separate new session.
 SESSION-STRATEGY overrides `agent-shell-session-strategy' buffer-locally.
-SESSION-ID resumes an existing session by its id string.
+SESSION-ID resumes an existing session by its id string (via
+`session/resume' or `session/load', whichever the agent supports and
+`agent-shell-session-restore-verbosity' calls for).  Used both by
+`agent-shell-resume-session' and `agent-shell-resume-project-session'
+\(which resolves CONFIG to that session's own agent first).
 FORK-SESSION-ID forks an existing session by its id string.
 OUTGOING-REQUEST-DECORATOR is passed through to `acp-make-client'."
   (unless (version<= "0.91.2" shell-maker-version)
@@ -4809,7 +4948,17 @@ variable (see makunbound)"))
          :event 'session-selection-cancelled
          :on-event (lambda (_event)
                      (kill-buffer shell-buffer)))
-        (let ((active-message (agent-shell-active-message-show :text "Loading...")))
+        (let ((active-message (agent-shell-active-message-show :text "Loading..." :buffer shell-buffer)))
+          ;; Track the indicator in state so teardown paths (interrupt,
+          ;; kill-buffer) can dismiss it even when the normal hide events
+          ;; never arrive (e.g. a start-up that hangs before session
+          ;; selection).  Add the key defensively for sessions created
+          ;; before it existed (mid-session package reload), otherwise
+          ;; `map-put!' cannot extend the alist in place.
+          (let ((state (agent-shell--state)))
+            (unless (assq :active-message state)
+              (nconc state (list (cons :active-message nil))))
+            (map-put! state :active-message active-message))
           (agent-shell-subscribe-to
            :shell-buffer shell-buffer
            :event 'session-prompt
@@ -6534,7 +6683,7 @@ through to `acp-send-request'."
                                        (map-elt state :active-requests)))
                  (when on-success
                    (funcall on-success acp-response)))
-   :on-failure (lambda (acp-error raw-message)
+   :on-failure (lambda (acp-error &optional raw-message)
                  (map-put! state :active-requests
                            (seq-remove (lambda (r)
                                          (equal r request))
@@ -7061,7 +7210,10 @@ Must provide ON-SESSION-INIT (lambda ())."
         (agent-shell--initiate-new-session
          :shell-buffer shell-buffer
          :on-session-init on-session-init))
-    ;; User requested resuming session with explicit session ID.
+    ;; User requested resuming session with explicit session ID (used both
+    ;; by `agent-shell-resume-session' and, via
+    ;; `agent-shell-resume-project-session', to resume a session read from
+    ;; this project's transcripts).
     (if-let* ((resume-session-id (map-elt (agent-shell--state) :resume-session-id)))
         (if (or (map-elt (agent-shell--state) :supports-session-load)
                 (map-elt (agent-shell--state) :supports-session-resume))
@@ -7322,6 +7474,7 @@ Falls back to latest session in batch mode (e.g. tests)."
             :session (agent-shell--session-from-response
                       :acp-response acp-response
                       :acp-session-id acp-session-id))
+  (acp-set-session-id (map-elt agent-shell--state :client) acp-session-id)
   (agent-shell--save-config-options
    :state agent-shell--state
    :acp-config-options (map-elt acp-response 'configOptions)))
@@ -7416,13 +7569,16 @@ overwrites an existing fragment with equivalent content."
    :request (acp-make-session-new-request
              :cwd (agent-shell--resolve-path (agent-shell-cwd))
              :mcp-servers (agent-shell--mcp-servers)
-             :meta (map-nested-elt (agent-shell--state) '(:agent-config :session-meta)))
+             :meta (map-nested-elt (agent-shell--state) '(:agent-config :session-meta))
+             :transcripts-dir (agent-shell--transcript-central-directory-for (agent-shell-cwd)))
    :buffer (current-buffer)
    :on-success (lambda (acp-response)
                  (map-put! agent-shell--state
                            :session (agent-shell--session-from-response
                                      :acp-response acp-response
                                      :acp-session-id (map-elt acp-response 'sessionId)))
+                 (acp-set-session-id (map-elt agent-shell--state :client)
+                                     (map-elt acp-response 'sessionId))
                  (agent-shell--save-config-options
                   :state agent-shell--state
                   :acp-config-options (map-elt acp-response 'configOptions))
@@ -7697,18 +7853,22 @@ SESSION-TITLE is an optional display title for the resumed session."
      :state (agent-shell--state)
      :client (map-elt (agent-shell--state) :client)
      :request (let ((cwd (agent-shell--resolve-path (agent-shell-cwd)))
-                    (mcp-servers (agent-shell--mcp-servers)))
+                    (mcp-servers (agent-shell--mcp-servers))
+                    (meta (map-nested-elt (agent-shell--state) '(:agent-config :session-meta)))
+                    (transcripts-dir (agent-shell--transcript-central-directory-for (agent-shell-cwd))))
                 (if use-load
                     (acp-make-session-load-request
                      :session-id session-id
                      :cwd cwd
                      :mcp-servers mcp-servers
-                     :meta (map-nested-elt (agent-shell--state) '(:agent-config :session-meta)))
+                     :meta meta
+                     :transcripts-dir transcripts-dir)
                   (acp-make-session-resume-request
                    :session-id session-id
                    :cwd cwd
                    :mcp-servers mcp-servers
-                   :meta (map-nested-elt (agent-shell--state) '(:agent-config :session-meta)))))
+                   :meta meta
+                   :transcripts-dir transcripts-dir)))
      :buffer (current-buffer)
      :on-success (lambda (acp-load-response)
                    (agent-shell--set-session-from-response
@@ -7754,7 +7914,8 @@ SESSION-TITLE is an optional display title for the resumed session."
              :session-id session-id
              :cwd (agent-shell--resolve-path (agent-shell-cwd))
              :mcp-servers (agent-shell--mcp-servers)
-             :meta (map-nested-elt (agent-shell--state) '(:agent-config :session-meta)))
+             :meta (map-nested-elt (agent-shell--state) '(:agent-config :session-meta))
+             :transcripts-dir (agent-shell--transcript-central-directory-for (agent-shell-cwd)))
    :buffer (current-buffer)
    :on-success (lambda (acp-fork-response)
                  (let ((new-session-id (map-elt acp-fork-response 'sessionId)))
@@ -7836,18 +7997,22 @@ SESSION-TITLE is an optional display title for the resumed session."
                                     :state (agent-shell--state)
                                     :client (map-elt (agent-shell--state) :client)
                                     :request (let ((cwd (agent-shell--resolve-path (agent-shell-cwd)))
-                                                   (mcp-servers (agent-shell--mcp-servers)))
+                                                   (mcp-servers (agent-shell--mcp-servers))
+                                                   (meta (map-nested-elt (agent-shell--state) '(:agent-config :session-meta)))
+                                                   (transcripts-dir (agent-shell--transcript-central-directory-for (agent-shell-cwd))))
                                                (if use-load
                                                    (acp-make-session-load-request
                                                     :session-id acp-session-id
                                                     :cwd cwd
                                                     :mcp-servers mcp-servers
-                                                    :meta (map-nested-elt (agent-shell--state) '(:agent-config :session-meta)))
+                                                    :meta meta
+                                                    :transcripts-dir transcripts-dir)
                                                  (acp-make-session-resume-request
                                                   :session-id acp-session-id
                                                   :cwd cwd
                                                   :mcp-servers mcp-servers
-                                                  :meta (map-nested-elt (agent-shell--state) '(:agent-config :session-meta)))))
+                                                  :meta meta
+                                                  :transcripts-dir transcripts-dir)))
                                     :buffer (current-buffer)
                                     :on-success (lambda (acp-load-response)
                                                   (agent-shell--set-session-from-response
@@ -7892,6 +8057,64 @@ SESSION-TITLE is an optional display title for the resumed session."
                  (agent-shell--initiate-new-session
                   :shell-buffer shell-buffer
                   :on-session-init on-session-init))))
+
+(defun agent-shell--project-session-choice-label (session)
+  "Format SESSION as a picker label: its agent, transcript filename, and a preview.
+
+The preview is the first line of the session's first user prompt (from
+`acp/listProjectSessions'), since a bare session id or timestamp alone
+doesn't say what a session was about.  SESSIONS can span multiple
+agents, so the agent name is shown too."
+  (format "%-12s %-24s %s"
+          (map-elt session 'agentName)
+          (file-name-nondirectory (or (map-elt session 'transcriptPath) ""))
+          (or (map-elt session 'preview) "(no messages yet)")))
+
+(defun agent-shell--prompt-select-project-session (sessions)
+  "Prompt to pick one of SESSIONS, as returned by `acp/listProjectSessions'.
+
+SESSIONS is already sorted newest first.  Return the picked session
+alist, or nil to start a new session instead."
+  (if (null sessions)
+      (progn (message "No project sessions found. Starting new session.") nil)
+    (let* ((new-session-choice "New session")
+           (choices (append (list (cons new-session-choice nil))
+                             (mapcar (lambda (session)
+                                       (cons (agent-shell--project-session-choice-label session)
+                                             session))
+                                     sessions)))
+           (selection (completing-read "Resume project session (default: New session): "
+                                       choices nil t nil nil new-session-choice)))
+      (map-elt choices selection))))
+
+(defun agent-shell--make-agentless-client ()
+  "Return a client good only for proxy methods that need no agent.
+
+`acp-make-client' requires either :command or :agent-name, but this
+client is only ever used with `acp-send-agentless-request', which
+never sends `acp/connectAgent' — so the name below is a placeholder,
+not a real agent."
+  (acp-make-client :agent-name "agent-shell/agentless"))
+
+(defun agent-shell--start-from-picked-project-session (picked)
+  "Start or resume based on PICKED session (or nil for a new session).
+
+PICKED is a session alist from `acp/listProjectSessions' (as chosen via
+`agent-shell--prompt-select-project-session'), or nil when the user
+chose to start a new session instead."
+  (if (null picked)
+      (agent-shell--start :config (or (agent-shell--auto-preferred-config)
+                                      (agent-shell-select-config
+                                       :prompt "Start with agent: ")
+                                      (error "No agent config found"))
+                          :new-session t)
+    (let* ((agent-name (map-elt picked 'agentName))
+           (config (agent-shell--resolve-config-designator (intern agent-name))))
+      (if config
+          (agent-shell--start :config config
+                              :new-session t
+                              :session-id (map-elt picked 'sessionId))
+        (message "Agent '%s' is not configured; can't resume that session." agent-name)))))
 
 (defun agent-shell--eval-dynamic-values (obj)
   "Recursively evaluate any lambda values in OBJ.
@@ -7959,6 +8182,7 @@ The agent config's `:mcp-servers' take precedence over the global
   "Subscribe SHELL and STATE to ACP events."
   (acp-subscribe-to-errors
    :client (map-elt state :client)
+   :buffer (map-elt state :buffer)
    :on-error (lambda (acp-error)
                (agent-shell--update-fragment
                 :state state
@@ -7972,6 +8196,7 @@ The agent config's `:mcp-servers' take precedence over the global
                 :above-last-prompt (not (shell-maker-busy)))))
   (acp-subscribe-to-notifications
    :client (map-elt state :client)
+   :buffer (map-elt state :buffer)
    :on-notification (lambda (acp-notification)
                       (agent-shell--on-notification
                        :state state
@@ -7982,6 +8207,7 @@ The agent config's `:mcp-servers' take precedence over the global
                        )))
   (acp-subscribe-to-requests
    :client (map-elt state :client)
+   :buffer (map-elt state :buffer)
    :on-request (lambda (acp-request)
                  (agent-shell--on-request :state state :acp-request acp-request))))
 
@@ -10652,6 +10878,106 @@ For example:
       (error
        (message "Failed to generate transcript path: %S" err)
        nil))))
+
+(defcustom agent-shell-transcript-central-directory nil
+  "Directory under which ALL projects' transcripts are physically stored.
+
+Applies to transcripts written by the proxy (see
+`agent-shell-resume-project-session'), not the legacy
+`agent-shell-transcript-file-path-function' path above.
+
+When non-nil, new transcripts are written here instead of directly
+under each project's `.agent-shell/transcripts/', with a symlink left
+in its place so transcripts stay browsable/resumable from the project
+as usual.  This means history survives deleting or moving the project.
+
+Each project gets its own subdirectory here, named by
+`agent-shell-transcript-directory-name-function' applied to the
+project's absolute path — analogous to `auto-save-list-file-prefix'
+paired with `auto-save-file-name-transform'.
+
+nil (the default) keeps the per-project-only behavior."
+  :type '(choice (const :tag "Disabled (default)" nil) directory)
+  :group 'agent-shell)
+
+(defun agent-shell--default-transcript-directory-name (project-path)
+  "Encode PROJECT-PATH as a flat, unique directory name.
+
+Mirrors the convention Emacs already uses for centralized auto-save
+files: replace each path separator with \"!\"."
+  (string-replace "/" "!" (directory-file-name (expand-file-name project-path))))
+
+(defcustom agent-shell-transcript-directory-name-function
+  #'agent-shell--default-transcript-directory-name
+  "Function mapping a project's absolute path to a subdirectory name.
+
+Called with one argument (the project's absolute path); must return a
+filesystem-safe, unique directory name (not a full path) to nest under
+`agent-shell-transcript-central-directory'."
+  :type 'function
+  :group 'agent-shell)
+
+(defvar agent-shell--transcript-migration-decided (make-hash-table :test 'equal)
+  "Projects already asked about migrating local transcripts this session.
+
+Keyed by absolute project path, so
+`agent-shell--transcript-central-directory-for' only prompts once per
+project per Emacs session, regardless of how many sessions are
+started/resumed/forked in it afterwards.")
+
+(defun agent-shell--migrate-local-transcripts-to-central (local-dir central-dir)
+  "Move LOCAL-DIR's contents into CENTRAL-DIR, then symlink LOCAL-DIR to it.
+
+Errors if CENTRAL-DIR already exists and isn't empty, rather than
+risking a silent merge/clobber.  The symlink is created immediately
+(rather than left for the proxy to create on the next session), so
+LOCAL-DIR is never left simply missing if the session that triggered
+this migration goes on to fail for an unrelated reason."
+  (when (and (file-exists-p central-dir)
+             (directory-files central-dir nil directory-files-no-dot-files-regexp))
+    (user-error "Migration target %s already exists and isn't empty" central-dir))
+  (when (file-exists-p central-dir)
+    (delete-directory central-dir))
+  (make-directory (file-name-directory (directory-file-name central-dir)) t)
+  (rename-file local-dir central-dir)
+  (make-symbolic-link central-dir local-dir)
+  (message "Migrated transcripts from %s to %s" local-dir central-dir))
+
+(defun agent-shell--transcript-central-directory-for (project-path)
+  "Return the central transcripts dir for PROJECT-PATH, or nil if disabled.
+
+`agent-shell-transcript-central-directory' must be an absolute path —
+a relative one would otherwise silently resolve against whatever the
+current buffer's `default-directory' happens to be (typically the
+project itself), producing a different, wrong, nested location for
+every project instead of one stable central directory.
+
+If PROJECT-PATH already has local transcript history (a real,
+non-symlink `.agent-shell/transcripts/'), asks once per Emacs session
+via `y-or-n-p' whether to move it into the central directory now (see
+`agent-shell--migrate-local-transcripts-to-central').  Declining just
+means this project keeps writing locally, same as before this feature
+existed — nothing else to opt out of."
+  (when agent-shell-transcript-central-directory
+    (unless (file-name-absolute-p agent-shell-transcript-central-directory)
+      (user-error "agent-shell-transcript-central-directory must be an absolute path, got: %s"
+                  agent-shell-transcript-central-directory))
+    (let* ((project-path (expand-file-name project-path))
+           (central-root (expand-file-name agent-shell-transcript-central-directory))
+           (central-dir (expand-file-name
+                         (funcall agent-shell-transcript-directory-name-function project-path)
+                         central-root))
+           (local-dir (expand-file-name ".agent-shell/transcripts" project-path)))
+      (when (and (not (gethash project-path agent-shell--transcript-migration-decided))
+                 (file-directory-p local-dir)
+                 (not (file-symlink-p local-dir))
+                 (directory-files local-dir nil directory-files-no-dot-files-regexp))
+        (puthash project-path t agent-shell--transcript-migration-decided)
+        (when (y-or-n-p
+               (format "This project already has local transcript history in %s.  Migrate it into %s now? "
+                       local-dir central-dir))
+          (agent-shell--migrate-local-transcripts-to-central local-dir central-dir)))
+      central-dir)))
 
 (defun agent-shell--ensure-transcript-file ()
   "Ensure the transcript file exists, creating it with header if needed.
