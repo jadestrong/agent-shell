@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::OnceLock;
 
 use anyhow::Result;
 use crossbeam_channel::Sender;
@@ -16,6 +17,26 @@ use crate::msg::{
     Message, Notification, Request, Response, AUTH_REQUIRED, INTERNAL_ERROR, INVALID_PARAMS,
     METHOD_NOT_FOUND,
 };
+
+/// Local UTC offset (in seconds), captured once at startup by
+/// `init_local_offset` and read by every transcript timestamp thereafter.
+static LOCAL_OFFSET_SECONDS: OnceLock<i64> = OnceLock::new();
+
+/// Captures the process's local UTC offset for transcript timestamps.
+///
+/// Must be called once, synchronously, before any additional threads exist
+/// (i.e. before the Tokio runtime starts in `main`) -- `time`'s
+/// `local-offset` feature can only soundly determine the local offset in a
+/// single-threaded process (reading the offset concurrently with another
+/// thread mutating the environment is a real hazard on Unix), so this can't
+/// just be queried fresh on every timestamp. Falls back to UTC (offset 0)
+/// if it can't be determined.
+pub fn init_local_offset() {
+    let offset = time::UtcOffset::current_local_offset()
+        .map(|o| o.whole_seconds() as i64)
+        .unwrap_or(0);
+    let _ = LOCAL_OFFSET_SECONDS.set(offset);
+}
 
 // ---------------------------------------------------------------------------
 // Emacs -> Proxy request methods
@@ -319,11 +340,20 @@ impl Application {
         (year as i32, m as u32, d as u32)
     }
 
-    fn now_label() -> String {
-        let secs = std::time::SystemTime::now()
+    /// Local wall-clock seconds since the Unix epoch (UTC epoch seconds
+    /// shifted by the process's local UTC offset, captured once at startup
+    /// via `init_local_offset` -- see its doc comment for why it can't just
+    /// be queried fresh each call).
+    fn local_now_secs() -> i64 {
+        let utc_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
+        utc_secs + LOCAL_OFFSET_SECONDS.get().copied().unwrap_or(0)
+    }
+
+    fn now_label() -> String {
+        let secs = Self::local_now_secs();
         let days = secs.div_euclid(86_400);
         let sod = secs.rem_euclid(86_400);
         let hour = sod / 3_600;
@@ -337,10 +367,7 @@ impl Application {
     }
 
     fn now_file_label() -> String {
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        let secs = Self::local_now_secs();
         let days = secs.div_euclid(86_400);
         let sod = secs.rem_euclid(86_400);
         let hour = sod / 3_600;

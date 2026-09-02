@@ -100,6 +100,10 @@ fn main() {
 
     init_tracing(log_level, cli.log_file.as_deref());
 
+    // Must happen before the Tokio runtime (spawned inside main_loop) starts
+    // any additional threads -- see init_local_offset's doc comment.
+    application::init_local_offset();
+
     tracing::info!("emacs-acp-proxy starting");
 
     let (connection, io_threads) = Connection::stdio();
