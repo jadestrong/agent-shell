@@ -3,7 +3,7 @@
 ;; Copyright (C) 2025
 
 ;; Author: emacs-acp-proxy contributors
-;; Version: 0.12.2
+;; Version: 0.14.3
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: tools, processes
 ;; URL: https://github.com/nicehiro/emacs-acp-proxy
@@ -39,7 +39,7 @@
       (goto-char (point-max))
       (insert (format "%s %s %s\n" direction kind (map-elt message :json))))))
 
-(defconst acp-package-version "0.13.1")
+(defconst acp-package-version "0.14.3")
 (defconst acp--jsonrpc-version "2.0")
 (defconst acp-proxy-handles-transcripts t
   "Non-nil when transcripts are written by the ACP proxy.")
@@ -511,8 +511,12 @@ of relying solely on the client's context buffer.
 Updates the alist in place so the change is visible to every holder of
 CLIENT, appending the key when absent.  `map-put!' is avoided here
 because it raises `map-not-inplace' when adding a new key to an alist
-\(e.g. for a client built before :session-id was pre-declared)."
-  (when client
+\(e.g. for a client built before :session-id was pre-declared).
+
+A no-op when CLIENT isn't a real client alist (e.g. a test double),
+rather than signalling -- stamping the id is purely a notification-
+routing optimization, not something worth failing a session over."
+  (when (and client (listp client))
     (if-let* ((cell (assq :session-id client)))
         (setcdr cell session-id)
       (nconc client (list (cons :session-id session-id))))))
@@ -631,15 +635,16 @@ and invoked with BUFFER as current."
                          (list :_meta meta)))
                (lambda (result) result))))
       ("session/new"
-       (let ((agent-name (or (map-elt client :agent-name)
-                             (error ":agent-name is required")))
-             (cwd (acp--get params 'cwd)))
+       (let* ((agent-name (or (map-elt client :agent-name)
+                              (error ":agent-name is required")))
+              (cwd (acp--get params 'cwd))
+              (meta (acp--get params '_meta)))
          (list "acp/newSession"
-               (list :agentName agent-name
-                     :cwd cwd
-                     :mcpServers (or (acp--get params 'mcpServers) [])
-                     :_meta (acp--get params '_meta)
-                     :transcriptsDir (acp--get params 'transcriptsDir))
+               (append (list :agentName agent-name
+                             :cwd cwd
+                             :mcpServers (or (acp--get params 'mcpServers) []))
+                       (when meta (list :_meta meta))
+                       (list :transcriptsDir (acp--get params 'transcriptsDir)))
                (lambda (result) result))))
       ("session/prompt"
        (let ((session-id (acp--get params 'sessionId))
@@ -668,11 +673,13 @@ and invoked with BUFFER as current."
       ("session/fork"
        ;; The proxy inherits the agent from the source session, so only the
        ;; source sessionId and the forked session's cwd are needed.
-       (list "acp/forkSession"
-             (list :sessionId (acp--get params 'sessionId)
-                   :cwd (acp--get params 'cwd)
-                   :transcriptsDir (acp--get params 'transcriptsDir))
-             (lambda (result) result)))
+       (let ((meta (acp--get params '_meta)))
+         (list "acp/forkSession"
+               (append (list :sessionId (acp--get params 'sessionId)
+                             :cwd (acp--get params 'cwd))
+                       (when meta (list :_meta meta))
+                       (list :transcriptsDir (acp--get params 'transcriptsDir)))
+               (lambda (result) result))))
       ("session/cancel"
        (list "acp/cancel"
              (list :sessionId (acp--get params 'sessionId)
@@ -684,25 +691,29 @@ and invoked with BUFFER as current."
        ;; The proxy relays this to the connected agent's own session/resume
        ;; (via SESSION-CAPABILITIES.resume); the client is already bound to
        ;; one specific agent, so agentName comes from it, not from params.
-       (let ((agent-name (or (map-elt client :agent-name)
-                             (error ":agent-name is required"))))
+       (let* ((agent-name (or (map-elt client :agent-name)
+                              (error ":agent-name is required")))
+              (meta (acp--get params '_meta)))
          (list "acp/resumeSession"
-               (list :sessionId (acp--get params 'sessionId)
-                     :agentName agent-name
-                     :cwd (acp--get params 'cwd)
-                     :transcriptsDir (acp--get params 'transcriptsDir))
+               (append (list :sessionId (acp--get params 'sessionId)
+                             :agentName agent-name
+                             :cwd (acp--get params 'cwd))
+                       (when meta (list :_meta meta))
+                       (list :transcriptsDir (acp--get params 'transcriptsDir)))
                (lambda (result) result))))
       ("session/load"
        ;; Same shape as session/resume, but replays prior history: any
        ;; session/update notifications the agent sends while loading arrive
        ;; through the normal notification channel, same as live prompting.
-       (let ((agent-name (or (map-elt client :agent-name)
-                             (error ":agent-name is required"))))
+       (let* ((agent-name (or (map-elt client :agent-name)
+                              (error ":agent-name is required")))
+              (meta (acp--get params '_meta)))
          (list "acp/loadSession"
-               (list :sessionId (acp--get params 'sessionId)
-                     :agentName agent-name
-                     :cwd (acp--get params 'cwd)
-                     :transcriptsDir (acp--get params 'transcriptsDir))
+               (append (list :sessionId (acp--get params 'sessionId)
+                             :agentName agent-name
+                             :cwd (acp--get params 'cwd))
+                       (when meta (list :_meta meta))
+                       (list :transcriptsDir (acp--get params 'transcriptsDir)))
                (lambda (result) result))))
       (_
        (list nil nil nil)))))
@@ -1136,7 +1147,7 @@ See https://agentclientprotocol.com/protocol/session-config-options"
                 (configId . ,config-id)
                 (value . ,value)))))
 
-(cl-defun acp-make-session-resume-request (&key session-id cwd mcp-servers transcripts-dir)
+(cl-defun acp-make-session-resume-request (&key session-id cwd mcp-servers meta transcripts-dir)
   "Instantiate a \"session/resume\" request.
 
 TRANSCRIPTS-DIR, when non-nil, is where the proxy should physically
@@ -1150,9 +1161,10 @@ store this session's transcripts (see
     (:params . ((sessionId . ,session-id)
                 (cwd . ,(directory-file-name (expand-file-name cwd)))
                 (mcpServers . ,(or mcp-servers []))
+                ,@(when meta `((_meta . ,meta)))
                 ,@(when transcripts-dir `((transcriptsDir . ,transcripts-dir)))))))
 
-(cl-defun acp-make-session-fork-request (&key session-id cwd mcp-servers transcripts-dir)
+(cl-defun acp-make-session-fork-request (&key session-id cwd mcp-servers meta transcripts-dir)
   "Instantiate a \"session/fork\" request.
 
 SESSION-ID is the ID of the session to fork from.
@@ -1178,6 +1190,7 @@ See https://agentclientprotocol.com/rfds/session-fork."
                 ;; directory-file-name removes any trailing /
                 (cwd . ,(directory-file-name (expand-file-name cwd)))
                 (mcpServers . ,(or mcp-servers []))
+                ,@(when meta `((_meta . ,meta)))
                 ,@(when transcripts-dir `((transcriptsDir . ,transcripts-dir)))))))
 
 (cl-defun acp-make-session-list-request (&key cwd)
@@ -1205,7 +1218,7 @@ other `acp-make-*-request'): this request is only meant to be sent via
   `((:method . "acp/listProjectSessions")
     (:params . ((cwd . ,(directory-file-name (expand-file-name cwd)))))))
 
-(cl-defun acp-make-session-load-request (&key session-id cwd mcp-servers transcripts-dir)
+(cl-defun acp-make-session-load-request (&key session-id cwd mcp-servers meta transcripts-dir)
   "Instantiate a \"session/load\" request.
 
 TRANSCRIPTS-DIR, when non-nil, is where the proxy should physically
@@ -1219,6 +1232,7 @@ store this session's transcripts (see
     (:params . ((sessionId . ,session-id)
                 (cwd . ,(directory-file-name (expand-file-name cwd)))
                 (mcpServers . ,(or mcp-servers []))
+                ,@(when meta `((_meta . ,meta)))
                 ,@(when transcripts-dir `((transcriptsDir . ,transcripts-dir)))))))
 
 (cl-defun acp-make-session-delete-request (&key session-id)

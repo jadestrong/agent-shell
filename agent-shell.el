@@ -7854,17 +7854,20 @@ SESSION-TITLE is an optional display title for the resumed session."
      :client (map-elt (agent-shell--state) :client)
      :request (let ((cwd (agent-shell--resolve-path (agent-shell-cwd)))
                     (mcp-servers (agent-shell--mcp-servers))
+                    (meta (map-nested-elt (agent-shell--state) '(:agent-config :session-meta)))
                     (transcripts-dir (agent-shell--transcript-central-directory-for (agent-shell-cwd))))
                 (if use-load
                     (acp-make-session-load-request
                      :session-id session-id
                      :cwd cwd
                      :mcp-servers mcp-servers
+                     :meta meta
                      :transcripts-dir transcripts-dir)
                   (acp-make-session-resume-request
                    :session-id session-id
                    :cwd cwd
                    :mcp-servers mcp-servers
+                   :meta meta
                    :transcripts-dir transcripts-dir)))
      :buffer (current-buffer)
      :on-success (lambda (acp-load-response)
@@ -7911,6 +7914,7 @@ SESSION-TITLE is an optional display title for the resumed session."
              :session-id session-id
              :cwd (agent-shell--resolve-path (agent-shell-cwd))
              :mcp-servers (agent-shell--mcp-servers)
+             :meta (map-nested-elt (agent-shell--state) '(:agent-config :session-meta))
              :transcripts-dir (agent-shell--transcript-central-directory-for (agent-shell-cwd)))
    :buffer (current-buffer)
    :on-success (lambda (acp-fork-response)
@@ -7993,18 +7997,22 @@ SESSION-TITLE is an optional display title for the resumed session."
                                     :state (agent-shell--state)
                                     :client (map-elt (agent-shell--state) :client)
                                     :request (let ((cwd (agent-shell--resolve-path (agent-shell-cwd)))
-                                                   (mcp-servers (agent-shell--mcp-servers)))
+                                                   (mcp-servers (agent-shell--mcp-servers))
+                                                   (meta (map-nested-elt (agent-shell--state) '(:agent-config :session-meta)))
+                                                   (transcripts-dir (agent-shell--transcript-central-directory-for (agent-shell-cwd))))
                                                (if use-load
                                                    (acp-make-session-load-request
                                                     :session-id acp-session-id
                                                     :cwd cwd
                                                     :mcp-servers mcp-servers
-                                                    :meta (map-nested-elt (agent-shell--state) '(:agent-config :session-meta)))
+                                                    :meta meta
+                                                    :transcripts-dir transcripts-dir)
                                                  (acp-make-session-resume-request
                                                   :session-id acp-session-id
                                                   :cwd cwd
                                                   :mcp-servers mcp-servers
-                                                  :meta (map-nested-elt (agent-shell--state) '(:agent-config :session-meta)))))
+                                                  :meta meta
+                                                  :transcripts-dir transcripts-dir)))
                                     :buffer (current-buffer)
                                     :on-success (lambda (acp-load-response)
                                                   (agent-shell--set-session-from-response

@@ -1481,6 +1481,10 @@ impl Application {
         // Parse cwd from params (optional, defaults to ".")
         let cwd = params.get("cwd").and_then(|v| v.as_str()).unwrap_or(".");
         let transcripts_dir = params.get("transcriptsDir").and_then(|v| v.as_str());
+        let meta = match Self::parse_meta(&params, &id) {
+            Ok(meta) => meta,
+            Err(response) => return response,
+        };
 
         // Find the connected agent
         let agent = match self.agents.get(&agent_name) {
@@ -1495,7 +1499,8 @@ impl Application {
         };
 
         let connection = agent.connection.clone();
-        let request = acp::schema::NewSessionRequest::new(cwd);
+        let mut request = acp::schema::NewSessionRequest::new(cwd);
+        request.meta = meta;
         tracing::debug!(
             "Sending new_session request to agent '{}' with cwd='{}'",
             agent_name,
@@ -1855,6 +1860,28 @@ impl Application {
         Response::new_ok(id, serde_json::json!({ "agents": agents }))
     }
 
+    /// Parses the optional `_meta` param shared by every session-creating
+    /// (and authenticate) request into ACP's reserved extensibility field.
+    ///
+    /// A JSON `null` is treated the same as an absent key -- callers often
+    /// send `"_meta":null` rather than omitting the field entirely.
+    fn parse_meta(
+        params: &serde_json::Value,
+        id: &crate::msg::RequestId,
+    ) -> Result<Option<acp::schema::Meta>, Response> {
+        params
+            .get("_meta")
+            .filter(|meta| !meta.is_null())
+            .cloned()
+            .map(|meta| {
+                serde_json::from_value(meta).map_err(|e| {
+                    tracing::warn!("invalid _meta: {}", e);
+                    Response::new_err(id.clone(), INVALID_PARAMS, "invalid _meta".into())
+                })
+            })
+            .transpose()
+    }
+
     async fn handle_authenticate(
         &mut self,
         id: crate::msg::RequestId,
@@ -1888,13 +1915,7 @@ impl Application {
             }
         };
 
-        let meta = params.get("_meta").cloned().map(|meta| {
-            serde_json::from_value(meta).map_err(|e| {
-                tracing::warn!("invalid authenticate _meta for agent {}: {}", agent_name, e);
-                Response::new_err(id.clone(), INVALID_PARAMS, "invalid _meta".into())
-            })
-        });
-        let meta = match meta.transpose() {
+        let meta = match Self::parse_meta(&params, &id) {
             Ok(meta) => meta,
             Err(response) => return response,
         };
@@ -2147,6 +2168,10 @@ impl Application {
             }
         };
         let transcripts_dir = params.get("transcriptsDir").and_then(|v| v.as_str());
+        let meta = match Self::parse_meta(&params, &id) {
+            Ok(meta) => meta,
+            Err(response) => return response,
+        };
 
         // Find the source session to inherit its agent.
         let agent_name = match self.sessions.get(&source_session_id) {
@@ -2174,7 +2199,8 @@ impl Application {
 
         // Forward fork request to the agent.
         let acp_session_id = acp::schema::SessionId::new(source_session_id.clone());
-        let request = acp::schema::ForkSessionRequest::new(acp_session_id, cwd.clone());
+        let mut request = acp::schema::ForkSessionRequest::new(acp_session_id, cwd.clone());
+        request.meta = meta;
         match connection.send_request(request).block_task().await {
             Ok(resp) => {
                 let new_session_id = resp.session_id.to_string();
@@ -2266,6 +2292,10 @@ impl Application {
             }
         };
         let transcripts_dir = params.get("transcriptsDir").and_then(|v| v.as_str());
+        let meta = match Self::parse_meta(&params, &id) {
+            Ok(meta) => meta,
+            Err(response) => return response,
+        };
 
         // Find the agent
         let agent = match self.agents.get(&agent_name) {
@@ -2296,7 +2326,8 @@ impl Application {
 
         // Forward resume request to the agent.
         let acp_session_id = acp::schema::SessionId::new(session_id.clone());
-        let request = acp::schema::ResumeSessionRequest::new(acp_session_id, cwd.clone());
+        let mut request = acp::schema::ResumeSessionRequest::new(acp_session_id, cwd.clone());
+        request.meta = meta;
         match connection.send_request(request).block_task().await {
             Ok(resp) => {
                 // Register the resumed session under its agent.
@@ -2383,6 +2414,10 @@ impl Application {
             }
         };
         let transcripts_dir = params.get("transcriptsDir").and_then(|v| v.as_str());
+        let meta = match Self::parse_meta(&params, &id) {
+            Ok(meta) => meta,
+            Err(response) => return response,
+        };
 
         // Find the agent
         let agent = match self.agents.get(&agent_name) {
@@ -2419,7 +2454,8 @@ impl Application {
         // to Emacs (and gets written to the transcript) the same way live
         // prompting does -- no extra relay needed here.
         let acp_session_id = acp::schema::SessionId::new(session_id.clone());
-        let request = acp::schema::LoadSessionRequest::new(acp_session_id, cwd.clone());
+        let mut request = acp::schema::LoadSessionRequest::new(acp_session_id, cwd.clone());
+        request.meta = meta;
         match connection.send_request(request).block_task().await {
             Ok(resp) => {
                 // Register the loaded session under its agent.
