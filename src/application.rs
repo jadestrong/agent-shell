@@ -660,6 +660,42 @@ impl Application {
         }
     }
 
+    /// Converts a snake_case `ToolKind` (e.g. "switch_mode") into a
+    /// human-readable label ("Switch Mode").
+    fn kind_display_name(kind: &str) -> String {
+        kind.split('_')
+            .filter(|word| !word.is_empty())
+            .map(|word| {
+                let mut chars = word.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Picks the header title for a tool call entry.
+    ///
+    /// Some agents set `title` to the exact command they're running (most
+    /// commonly `execute` calls), which would otherwise duplicate the
+    /// `**Command:**` field right below it verbatim. In that case, fall back
+    /// to a label derived from `kind` instead.
+    fn tool_call_display_title(
+        title: Option<&str>,
+        kind: Option<&str>,
+        command: Option<&str>,
+    ) -> String {
+        match (title, command) {
+            (Some(title), Some(command)) if title.trim() == command.trim() => kind
+                .filter(|k| !k.is_empty())
+                .map(Self::kind_display_name)
+                .unwrap_or_else(|| "Tool Call".to_string()),
+            _ => title.unwrap_or("").to_string(),
+        }
+    }
+
     fn make_tool_call_entry(
         status: Option<&str>,
         title: Option<&str>,
@@ -676,7 +712,7 @@ impl Application {
         entry.push_str(&format!(
             "\n\n### Tool Call [{}]: {}\n",
             status.unwrap_or("no status"),
-            title.unwrap_or("")
+            Self::tool_call_display_title(title, kind, command)
         ));
         if let Some(kind) = kind {
             if !kind.is_empty() {
@@ -721,7 +757,11 @@ impl Application {
             .and_then(|s| s.last_entry_type.as_deref())
             != Some(entry_type);
         if needs_new_heading {
-            let md = format!("\n## {} ({})\n\n", heading, Self::now_label());
+            // Streamed chunk bodies (agent_message_chunk/agent_thought_chunk)
+            // don't carry a guaranteed trailing blank line, so this needs two
+            // leading newlines -- not one -- to always separate a new heading
+            // from whatever text immediately preceded it.
+            let md = format!("\n\n## {} ({})\n\n", heading, Self::now_label());
             self.append_session_transcript(session_id, &md);
             let state = self
                 .session_transcript_state
@@ -848,16 +888,14 @@ impl Application {
                 }
 
                 if matches!(status, Some("completed") | Some("failed")) {
+                    // Each entry is a `ToolCallContent`, most commonly the
+                    // `Content` variant wrapping a `ContentBlock` one level
+                    // deeper (`{"type":"content","content":{"type":"text",
+                    // "text":"..."}}`) -- `extract_text_from_value` already
+                    // unwraps that shape for message/thought chunks.
                     let output = update
                         .get("content")
-                        .and_then(|v| v.as_array())
-                        .map(|items| {
-                            items
-                                .iter()
-                                .filter_map(|item| item.get("text").and_then(|v| v.as_str()))
-                                .collect::<Vec<_>>()
-                                .join("\n\n")
-                        })
+                        .map(Self::extract_text_from_value)
                         .unwrap_or_default();
                     let output = format!("\n\n{}\n\n", output);
 
@@ -4043,5 +4081,73 @@ mod tests {
             }
             other => panic!("expected Response, got {other:?}"),
         }
+    }
+
+    // -- extract_text_from_value ---------------------------------------------
+
+    #[test]
+    fn extract_text_from_value_unwraps_tool_call_content_shape() {
+        // Real wire shape of a completed tool_call_update's `content` array:
+        // each entry is a `ToolCallContent::Content`, wrapping the actual
+        // `ContentBlock` one level deeper under `content`.
+        let content = serde_json::json!([
+            {
+                "type": "content",
+                "content": {
+                    "type": "text",
+                    "text": "file contents here"
+                }
+            }
+        ]);
+        assert_eq!(
+            Application::extract_text_from_value(&content),
+            "file contents here"
+        );
+    }
+
+    #[test]
+    fn extract_text_from_value_joins_multiple_tool_call_content_entries() {
+        let content = serde_json::json!([
+            {"type": "content", "content": {"type": "text", "text": "line one"}},
+            {"type": "content", "content": {"type": "text", "text": "line two"}}
+        ]);
+        assert_eq!(
+            Application::extract_text_from_value(&content),
+            "line one\n\nline two"
+        );
+    }
+
+    // -- tool_call_display_title ---------------------------------------------
+
+    #[test]
+    fn tool_call_display_title_falls_back_to_kind_when_title_duplicates_command() {
+        let title = Application::tool_call_display_title(
+            Some("find . -name '*.rs'"),
+            Some("execute"),
+            Some("find . -name '*.rs'"),
+        );
+        assert_eq!(title, "Execute");
+    }
+
+    #[test]
+    fn tool_call_display_title_keeps_title_when_it_differs_from_command() {
+        let title = Application::tool_call_display_title(
+            Some("List Rust source files"),
+            Some("execute"),
+            Some("find . -name '*.rs'"),
+        );
+        assert_eq!(title, "List Rust source files");
+    }
+
+    #[test]
+    fn tool_call_display_title_keeps_title_when_no_command() {
+        let title = Application::tool_call_display_title(Some("Read config.toml"), Some("read"), None);
+        assert_eq!(title, "Read config.toml");
+    }
+
+    #[test]
+    fn kind_display_name_title_cases_snake_case() {
+        assert_eq!(Application::kind_display_name("execute"), "Execute");
+        assert_eq!(Application::kind_display_name("switch_mode"), "Switch Mode");
     }
 }
